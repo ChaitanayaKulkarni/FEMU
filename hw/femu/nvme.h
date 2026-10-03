@@ -144,6 +144,7 @@ enum NvmeIdCtrlCtratt {
     NVME_CTRATT_ENDGRPS = 1 <<  4,
     NVME_CTRATT_ELBAS   = 1 << 15,
     NVME_CTRATT_FDPS    = 1 << 19,
+    NVME_CTRATT_CDLSUPP = 1 << 28,   /* TP4221: CDL supported */
 };
 
 typedef struct QEMU_PACKED NvmeFdpEvent {
@@ -1415,6 +1416,7 @@ enum NvmeFeatureIds {
     NVME_FDP_MODE                   = 0x1d,
     NVME_FDP_EVENTS                 = 0x1e,
     NVME_SOFTWARE_PROGRESS_MARKER   = 0x80,
+    NVME_CDL_CFG                    = 0xc0,   /* TP4221: CDL class config (vendor-specific) */
     NVME_FID_MAX                    = 0x100
 };
 
@@ -1451,6 +1453,77 @@ typedef struct NvmeLBAF {
     uint8_t     lbads;
     uint8_t     rp;
 } NvmeLBAF;
+
+/* TP4221 CDL structs — sizes fixed by CDL_WFQ_ABI_v1.1.txt §4/§5 */
+
+#define CDL_MAX_CLASSES     8       /* classes 0-7; class 0 = bypass */
+#define CDL_LOG_PAGE_C0     0xc0    /* CDL class descriptor log */
+#define CDL_LOG_PAGE_C1     0xc1    /* CDL per-class statistics log */
+#define CDL_ABI_VERSION     1
+#define CDL_PAGE_VERSION    1
+
+/* Per-class command duration limit descriptor (16 bytes) */
+typedef struct QEMU_PACKED NvmeCdlDescriptor {
+    uint64_t    duration_ns;    /* CDL duration limit; 0 = class disabled */
+    uint32_t    guide_ns;       /* informational guide latency */
+    uint16_t    desc_gen;       /* descriptor generation; init=0, first set→1,
+                                 * wraps 65535→1 (never wraps to 0) */
+    uint8_t     policy;         /* 0=complete, 1=abort on expiry */
+    uint8_t     reserved;
+} NvmeCdlDescriptor;
+
+/* Log Page 0xC0 — CDL class descriptors (512 bytes) */
+typedef struct QEMU_PACKED NvmeCdlLogPage0xC0 {
+    /* 16-byte header */
+    uint16_t            page_version;           /* bytes 0-1 */
+    uint16_t            num_classes;            /* bytes 2-3 */
+    uint8_t             cdl_version;            /* byte 4 */
+    uint8_t             cdl_flags;              /* byte 5; bit 0 = CDL enabled */
+    uint8_t             hdr_reserved[10];       /* bytes 6-15 */
+    /* Read descriptors at offset 16 (8 × 16 = 128 bytes) */
+    NvmeCdlDescriptor   read[CDL_MAX_CLASSES];
+    /* Write descriptors at offset 144 (8 × 16 = 128 bytes) */
+    NvmeCdlDescriptor   write[CDL_MAX_CLASSES];
+    /* Padding to 512 bytes */
+    uint8_t             pad[240];
+} NvmeCdlLogPage0xC0;
+
+/* Per-class statistics entry (24 bytes) */
+typedef struct QEMU_PACKED NvmeCdlClassStats {
+    uint64_t    miss_count;     /* CDL deadline misses for this class */
+    uint64_t    last_miss_ns;   /* QEMU_CLOCK_VIRTUAL at last miss */
+    uint64_t    completions;    /* total completions for this class */
+} NvmeCdlClassStats;
+
+/* Log Page 0xC1 — CDL per-class statistics (256 bytes) */
+typedef struct QEMU_PACKED NvmeCdlLogPage0xC1 {
+    /* 8-byte header */
+    uint16_t            version;                /* bytes 0-1 */
+    uint8_t             hdr_reserved[6];        /* bytes 2-7 */
+    /* Per-class stats at offset 8 (8 × 24 = 192 bytes) */
+    NvmeCdlClassStats   stats[CDL_MAX_CLASSES];
+    /* Padding to 256 bytes */
+    uint8_t             pad[56];
+} NvmeCdlLogPage0xC1;
+
+/* CDL Set/Get Features CDW11 CDLOP field (bits 1:0 of CDW11) */
+#define CDL_CDLOP(dw11)         ((dw11) & 0x3)
+#define CDL_CDLOP_ENABLE        0x0     /* CDW11[1:0]=00b: enable/disable */
+#define CDL_CDLOP_BIND          0x1     /* CDW11[1:0]=01b: bind SQ to class */
+#define CDL_CDLOP_SET_DESC      0x2     /* CDW11[1:0]=10b: set descriptor */
+#define CDL_CDLOP_INVALID       0x3     /* CDW11[1:0]=11b: reserved */
+
+/* CDL status codes (SCT=7h vendor-specific, assembled as (7<<9)|SC) */
+#define CDL_STATUS(sc)          (NVME_SCT_VENDOR_SPECIFIC << 9 | (sc))
+#define CDL_STATUS_BUSY         CDL_STATUS(0x01)    /* CDL busy, retry later */
+#define CDL_STATUS_BAD_DESC     CDL_STATUS(0x02)    /* invalid descriptor fields */
+#define CDL_STATUS_BAD_CLASS    CDL_STATUS(0x03)    /* class 0 or out of range */
+#define CDL_STATUS_BAD_SQID     CDL_STATUS(0x04)    /* SQID not found */
+#define CDL_STATUS_NOT_ENABLED  CDL_STATUS(0x05)    /* CDL not enabled */
+
+#ifndef NVME_SCT_VENDOR_SPECIFIC
+#define NVME_SCT_VENDOR_SPECIFIC 0x7
+#endif
 
 #define NVME_NSID_BROADCAST 0xffffffff
 
@@ -1562,6 +1635,11 @@ static inline void nvme_check_size(void)
     QEMU_BUILD_BUG_ON(sizeof(NvmeRuhuDescr) != 8);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpStatsLog) != 64);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpEventsLog) != 64);
+    /* TP4221 CDL struct sizes — must match ABI v1.1 §4/§5 */
+    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlDescriptor)   != 16);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlLogPage0xC0)  != 512);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlClassStats)   != 24);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlLogPage0xC1)  != 256);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpEvent) != 64);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpEventDescr) != 2);
     QEMU_BUILD_BUG_ON(sizeof(NvmeRuhStatus) != 16);
@@ -1702,6 +1780,11 @@ typedef struct NvmeSQueue {
     uint64_t    eventidx_addr;
     uint64_t    eventidx_addr_hva;
     bool        is_active;
+
+    /* TP4221 CDL: class binding, set at runtime via Set Features FID 0xC0 */
+    uint8_t     cdl_class;      /* 0 = no CDL (bypass), 1-7 = CDL class */
+    uint16_t    cdl_desc_gen;   /* desc_gen snapshot at bind time; stale if
+                                 * descriptor was updated after binding */
 } NvmeSQueue;
 
 typedef struct NvmeCQueue {
@@ -2269,6 +2352,14 @@ typedef struct FemuCtrl {
     CsdCtrlParams   csd_params;
 
     Oc12Ctrl  *oc12_ctrl;
+
+    /* TP4221 CDL state — protected by cdl_lock from poller threads */
+    bool                cdl_enabled;                        /* Set Features CDLOP=00b */
+    NvmeCdlDescriptor   cdl_read[CDL_MAX_CLASSES];          /* read class descriptors */
+    NvmeCdlDescriptor   cdl_write[CDL_MAX_CLASSES];         /* write class descriptors */
+    NvmeCdlClassStats   cdl_stats[CDL_MAX_CLASSES];         /* per-class miss/completion counters */
+    pthread_spinlock_t  cdl_lock;                           /* guards cdl_stats updates */
+
     volatile int64_t chip_next_avail_time[FEMU_MAX_NUM_CHIPS];
     pthread_spinlock_t chip_locks[FEMU_MAX_NUM_CHIPS];
     volatile int64_t chnl_next_avail_time[FEMU_MAX_NUM_CHNLS];
