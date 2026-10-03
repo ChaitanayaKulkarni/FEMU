@@ -29,6 +29,7 @@ static const bool nvme_feature_support[NVME_FID_MAX] = {
     [NVME_SOFTWARE_PROGRESS_MARKER] = true,
     [NVME_HOST_BEHAVIOR_SUPPORT]    = true,
     [NVME_TIMESTAMP]                = true,
+    [NVME_CDL_CFG]                  = true,
 };
 
 static const uint32_t nvme_feature_cap[NVME_FID_MAX] = {
@@ -52,6 +53,7 @@ static const uint32_t nvme_feature_cap[NVME_FID_MAX] = {
                                       NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
     [NVME_KV_FEAT_CONFIG]           = NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
     [NVME_SOFTWARE_PROGRESS_MARKER] = NVME_FEAT_CAP_CHANGE,
+    [NVME_CDL_CFG]                  = NVME_FEAT_CAP_CHANGE,
 };
 
 static const uint32_t nvme_cse_acs[256] = {
@@ -816,6 +818,9 @@ static uint16_t nvme_identify_ctrl(FemuCtrl *n, NvmeCmd *cmd)
         }
     }
 
+    /* TP4221: advertise CDL support (CTRATT bit 28) */
+    n->id_ctrl.ctratt |= cpu_to_le32(NVME_CTRATT_CDLSUPP);
+
     return dma_read_prp(n, (uint8_t *)&n->id_ctrl, sizeof(n->id_ctrl),
                              prp1, prp2);
 }
@@ -1167,6 +1172,109 @@ static uint16_t nvme_identify(FemuCtrl *n, NvmeCmd *cmd)
     }
 }
 
+/* TP4221: CDL Set/Get Features FID 0xC0 helpers */
+
+static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
+{
+    static const uint64_t tfu_mult[4] = {100, 1000, 10000, 1000000};
+    uint8_t cdlop = CDL_CDLOP(dw11);
+
+    switch (cdlop) {
+    case CDL_CDLOP_ENABLE: {
+        bool enable = !!(dw11 & 0x4);
+        pthread_spin_lock(&n->cdl_lock);
+        n->cdl_enabled = enable;
+        pthread_spin_unlock(&n->cdl_lock);
+        break;
+    }
+    case CDL_CDLOP_BIND: {
+        uint8_t cls  = (dw11 >> 8) & 0x7;
+        uint8_t sqid = (dw11 >> 16) & 0xff;
+
+        if (sqid == 0 || sqid > n->nr_io_queues || !n->sq[sqid]) {
+            return CDL_STATUS_BAD_SQID;
+        }
+        if (cls > 7) {
+            return CDL_STATUS_BAD_CLASS;
+        }
+        if (cls != 0) {
+            pthread_spin_lock(&n->cdl_lock);
+            bool configured = (n->cdl_read[cls].duration_ns > 0 ||
+                               n->cdl_write[cls].duration_ns > 0);
+            pthread_spin_unlock(&n->cdl_lock);
+            if (!configured) {
+                return CDL_STATUS_BAD_DESC;
+            }
+        }
+        pthread_spin_lock(&n->cdl_lock);
+        n->sq[sqid]->cdl_class = cls;
+        pthread_spin_unlock(&n->cdl_lock);
+        break;
+    }
+    case CDL_CDLOP_SET_DESC: {
+        uint8_t  cls    = (dw11 >> 8) & 0x7;
+        bool     is_wr  = !!(dw11 & (1u << 11));
+        uint32_t dur    = le32_to_cpu(cmd->cdw12);
+        uint32_t cdw13  = le32_to_cpu(cmd->cdw13);
+        uint8_t  tfu    = cdw13 & 0x3;
+        uint8_t  policy = (cdw13 >> 2) & 0x3;
+        uint32_t guide  = le32_to_cpu(cmd->cdw14);
+
+        if (cls == 0 || cls >= CDL_MAX_CLASSES) {
+            return CDL_STATUS_BAD_CLASS;
+        }
+        if (policy != 0) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        if (dur == 0) {
+            return CDL_STATUS_BAD_CLASS;
+        }
+        uint64_t duration_ns = (uint64_t)dur * tfu_mult[tfu];
+        if (duration_ns > CDL_MAX_NS) {
+            return CDL_STATUS_BAD_CLASS;
+        }
+        uint64_t guide_ns = (uint64_t)guide * tfu_mult[tfu];
+
+        pthread_spin_lock(&n->cdl_lock);
+        NvmeCdlDescriptor *desc = is_wr ? &n->cdl_write[cls] : &n->cdl_read[cls];
+        desc->duration_ns = duration_ns;
+        desc->guide_ns    = (uint32_t)MIN(guide_ns, UINT32_MAX);
+        desc->policy      = policy;
+        uint16_t gen      = desc->desc_gen;
+        desc->desc_gen    = (gen >= UINT16_MAX) ? 1 : gen + 1;
+        pthread_spin_unlock(&n->cdl_lock);
+        break;
+    }
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_cdl_get_feature(FemuCtrl *n, uint32_t dw11, NvmeCqe *cqe)
+{
+    uint8_t cdlop = CDL_CDLOP(dw11);
+
+    switch (cdlop) {
+    case CDL_CDLOP_ENABLE:
+        cqe->n.result = cpu_to_le32(n->cdl_enabled ? 1 : 0);
+        break;
+    case CDL_CDLOP_BIND: {
+        uint8_t sqid = (dw11 >> 16) & 0xff;
+        if (sqid == 0 || sqid > n->nr_io_queues || !n->sq[sqid]) {
+            return CDL_STATUS_BAD_SQID;
+        }
+        cqe->n.result = cpu_to_le32(n->sq[sqid]->cdl_class);
+        break;
+    }
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
+}
+
 /* true when some namespace answers the key-value command set */
 /*
  * The value a feature has before the host changes it: what realize set, so
@@ -1474,6 +1582,8 @@ static uint16_t nvme_get_feature(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
         stq_le_p(ts, nvme_timestamp(n));
         return dma_read_prp(n, ts, sizeof(ts), prp1, prp2);
     }
+    case NVME_CDL_CFG:
+        return nvme_cdl_get_feature(n, dw11, cqe);
     default:
         return NVME_INVALID_FIELD | NVME_DNR;
     }
@@ -1787,6 +1897,8 @@ static uint16_t nvme_set_feature(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
             return NVME_IOCS_COMBINATION_REJECTED | NVME_DNR;
         }
         break;
+    case NVME_CDL_CFG:
+        return nvme_cdl_set_feature(n, cmd, dw11);
     default:
         return NVME_INVALID_FIELD | NVME_DNR;
     }

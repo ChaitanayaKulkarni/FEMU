@@ -1457,6 +1457,7 @@ typedef struct NvmeLBAF {
 /* TP4221 CDL structs — sizes fixed by CDL_WFQ_ABI_v1.1.txt §4/§5 */
 
 #define CDL_MAX_CLASSES     8       /* classes 0-7; class 0 = bypass */
+#define CDL_MAX_NS          100000000ULL  /* 100 ms in nanoseconds — max duration_ns */
 #define CDL_LOG_PAGE_C0     0xc0    /* CDL class descriptor log */
 #define CDL_LOG_PAGE_C1     0xc1    /* CDL per-class statistics log */
 #define CDL_ABI_VERSION     1
