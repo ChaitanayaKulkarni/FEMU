@@ -818,9 +818,6 @@ static uint16_t nvme_identify_ctrl(FemuCtrl *n, NvmeCmd *cmd)
         }
     }
 
-    /* TP4221: advertise CDL support (CTRATT bit 28) */
-    n->id_ctrl.ctratt |= cpu_to_le32(NVME_CTRATT_CDLSUPP);
-
     return dma_read_prp(n, (uint8_t *)&n->id_ctrl, sizeof(n->id_ctrl),
                              prp1, prp2);
 }
@@ -1182,20 +1179,23 @@ static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
     switch (cdlop) {
     case CDL_CDLOP_ENABLE: {
         bool enable = !!(dw11 & 0x4);
+        /*
+         * ABI §3.1: scheduler must be idle (in_flight==NULL, all class
+         * queues empty) before toggling CDLE.  The idle check is enforced
+         * in Milestone C when the WFQ state machine exists.  Until then
+         * the controller is always idle so the precondition trivially holds.
+         */
         pthread_spin_lock(&n->cdl_lock);
         n->cdl_enabled = enable;
         pthread_spin_unlock(&n->cdl_lock);
         break;
     }
     case CDL_CDLOP_BIND: {
-        uint8_t cls  = (dw11 >> 8) & 0x7;
+        uint8_t cls  = (dw11 >> 8) & 0x7;   /* bits [10:8]: 3 bits → 0-7, all valid */
         uint8_t sqid = (dw11 >> 16) & 0xff;
 
         if (sqid == 0 || sqid > n->nr_io_queues || !n->sq[sqid]) {
             return CDL_STATUS_BAD_SQID;
-        }
-        if (cls > 7) {
-            return CDL_STATUS_BAD_CLASS;
         }
         if (cls != 0) {
             pthread_spin_lock(&n->cdl_lock);

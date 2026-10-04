@@ -1149,7 +1149,7 @@ enum NvmeLogIdentifier {
     NVME_LOG_FDP_EVENTS     = 0x23,
     NVME_LOG_CHANGED_ZONE_LIST  = 0xbf,
     NVME_LOG_SANITIZE           = 0x81,
-    NVME_LOG_FEMU_STATS         = 0xc0,
+    NVME_LOG_FEMU_STATS         = 0xca,   /* moved from 0xc0: 0xc0/0xc1 reserved for CDL */
 };
 
 /* LID Supported and Effects data structure, one per log page identifier */

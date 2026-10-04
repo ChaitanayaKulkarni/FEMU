@@ -1697,6 +1697,9 @@ static void nvme_init_ctrl(FemuCtrl *n)
         id->endgidmax = cpu_to_le16(1);
     }
 
+    /* TP4221: advertise CDL support unconditionally (CTRATT bit 28) */
+    id->ctratt |= cpu_to_le32(NVME_CTRATT_CDLSUPP);
+
     id->oacs         = cpu_to_le16(n->oacs | NVME_OACS_DBBUF | NVME_OACS_DST |
                                    NVME_OACS_GLSS);
     if (n->streams) {
@@ -2390,6 +2393,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     n->fw_cpu_next_avail_time = 0;
     pthread_spin_init(&n->pcie_lock, PTHREAD_PROCESS_PRIVATE);
     pthread_spin_init(&n->fw_cpu_lock, PTHREAD_PROCESS_PRIVATE);
+    pthread_spin_init(&n->cdl_lock, PTHREAD_PROCESS_PRIVATE);
 
     n->completed = 0;
     n->power_on_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -2718,6 +2722,7 @@ static void femu_exit(PCIDevice *pci_dev)
     }
     pthread_spin_destroy(&n->pcie_lock);
     pthread_spin_destroy(&n->fw_cpu_lock);
+    pthread_spin_destroy(&n->cdl_lock);
 
     /* FDP: unregister controller from subsystem */
     if (n->subsys) {
