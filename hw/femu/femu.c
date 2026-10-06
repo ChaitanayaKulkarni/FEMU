@@ -2415,6 +2415,8 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     pthread_spin_init(&n->fw_cpu_lock, PTHREAD_PROCESS_PRIVATE);
     pthread_spin_init(&n->cdl_lock, PTHREAD_PROCESS_PRIVATE);
     wfq_init(n);
+    g_assert(n->wfq_depth > 0 && n->wfq_depth <= FEMU_MAX_INF_REQS);
+    wfq_recompute_limits(n);
 
     n->completed = 0;
     n->power_on_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -2787,6 +2789,7 @@ static const Property femu_props[] = {
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
     DEFINE_PROP_UINT32("queues", FemuCtrl, nr_io_queues, 8),
     DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
+    DEFINE_PROP_UINT32("wfq_depth", FemuCtrl, wfq_depth, 64),
     DEFINE_PROP_UINT8("multipoller_enabled", FemuCtrl, multipoller_enabled, 0),
     DEFINE_PROP_UINT32("poller_ratio", FemuCtrl, poller_ratio, 1),
     DEFINE_PROP_BOOL("hiops_inline", FemuCtrl, hiops_inline, true),

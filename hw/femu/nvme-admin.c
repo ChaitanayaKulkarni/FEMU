@@ -163,15 +163,22 @@ static uint16_t nvme_del_sq(FemuCtrl *n, NvmeCmd *cmd)
         }
     }
     /*
-     * If the single in-flight WFQ request belongs to this SQ, it has already
-     * been dequeued from to_ftl by the FTL thread and is not reachable by
-     * nvme_drain_sq().  Zero wfq_cdl_class before nvme_free_sq() reclaims
-     * the request storage so that the wfq_on_complete() early-return guard
-     * triggers when the FTL eventually posts the result to to_poller.
+     * Scan per-class in-flight lists for requests that belong to this SQ.
+     * These are already in the FTL (past to_ftl ring) and not reachable by
+     * nvme_drain_sq().  Zero wfq_cdl_class and set wfq_orphaned so that
+     * wfq_on_complete() skips stats but does NOT double-decrement the counter.
+     * We decrement wfq_inflight[cls] here under cdl_lock.
      */
-    if (n->wfq_in_flight && n->wfq_in_flight->sq == sq) {
-        n->wfq_in_flight->wfq_cdl_class = 0;
-        n->wfq_in_flight = NULL;
+    for (int cls = 1; cls < CDL_MAX_CLASSES; cls++) {
+        NvmeRequest *wreq, *wtmp;
+        QTAILQ_FOREACH_SAFE(wreq, &n->wfq_inflight_list[cls], wfq_inflight_entry, wtmp) {
+            if (wreq->sq == sq) {
+                wreq->wfq_cdl_class = 0;
+                wreq->wfq_orphaned  = true;
+                QTAILQ_REMOVE(&n->wfq_inflight_list[cls], wreq, wfq_inflight_entry);
+                n->wfq_inflight[cls]--;
+            }
+        }
     }
     pthread_spin_unlock(&n->cdl_lock);
 
@@ -1206,9 +1213,9 @@ static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
     case CDL_CDLOP_ENABLE: {
         bool enable = !!(dw11 & 0x4);
         pthread_spin_lock(&n->cdl_lock);
-        bool idle = (n->wfq_in_flight == NULL);
+        bool idle = true;
         for (int c = 1; c < CDL_MAX_CLASSES && idle; c++) {
-            idle = QTAILQ_EMPTY(&n->wfq_queues[c]);
+            idle = (n->wfq_inflight[c] == 0) && QTAILQ_EMPTY(&n->wfq_queues[c]);
         }
         if (!idle) {
             pthread_spin_unlock(&n->cdl_lock);
@@ -1240,6 +1247,7 @@ static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
         pthread_spin_lock(&n->cdl_lock);
         n->sq[sqid]->cdl_class = cls;
         pthread_spin_unlock(&n->cdl_lock);
+        wfq_recompute_limits(n);
         break;
     }
     case CDL_CDLOP_SET_DESC: {
@@ -1277,6 +1285,7 @@ static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
         uint16_t gen      = desc->desc_gen;
         desc->desc_gen    = (gen >= UINT16_MAX) ? 1 : gen + 1;
         pthread_spin_unlock(&n->cdl_lock);
+        wfq_recompute_limits(n);
         break;
     }
     default:

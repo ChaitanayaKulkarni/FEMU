@@ -340,7 +340,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         if (status == NVME_SUCCESS && n->cdl_enabled && sq->cdl_class != 0 &&
             (req->cmd_opcode == NVME_CMD_READ ||
              req->cmd_opcode == NVME_CMD_WRITE)) {
-            req->wfq_cdl_class = 0; /* cleared; wfq_defer will set it */
+            req->wfq_cdl_class = sq->cdl_class; /* capture now; wfq_defer reads from req */
             req->defer = wfq_defer;
         }
 

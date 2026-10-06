@@ -1756,7 +1756,9 @@ typedef struct NvmeRequest {
     int64_t         wfq_ingestion_ns;   /* QEMU_CLOCK_VIRTUAL at enqueue */
     uint8_t         wfq_cdl_class;      /* class at ingestion; 0 = bypass */
     int             wfq_poller_idx;     /* poller that submitted this request */
-    QTAILQ_ENTRY(NvmeRequest) wfq_entry; /* linkage in per-class FIFO */
+    QTAILQ_ENTRY(NvmeRequest) wfq_entry;          /* linkage in per-class FIFO */
+    QTAILQ_ENTRY(NvmeRequest) wfq_inflight_entry; /* linkage in per-class in-flight list */
+    bool wfq_orphaned; /* set under cdl_lock by SQ delete; suppresses stats on completion */
 } NvmeRequest;
 
 typedef struct DMAOff {
@@ -2371,10 +2373,13 @@ typedef struct FemuCtrl {
     pthread_spinlock_t  cdl_lock;                           /* guards all CDL + WFQ state */
 
     /* TP4221 WFQ scheduler state — protected by cdl_lock */
-    NvmeRequest        *wfq_in_flight;                      /* NULL or command in NAND (v1: single slot) */
-    uint64_t            wfq_v_clock;                        /* SCFQ virtual clock */
-    uint64_t            wfq_f_last[CDL_MAX_CLASSES];        /* last finish tag per class */
-    QTAILQ_HEAD(, NvmeRequest) wfq_queues[CDL_MAX_CLASSES]; /* per-class ingestion FIFOs */
+    uint32_t            wfq_inflight[CDL_MAX_CLASSES];          /* commands in FTL for class c */
+    uint32_t            wfq_max_inflight[CDL_MAX_CLASSES];      /* weight-proportional dispatch cap */
+    uint32_t            wfq_depth;                              /* total CDL in-flight capacity (device prop) */
+    QTAILQ_HEAD(, NvmeRequest) wfq_inflight_list[CDL_MAX_CLASSES]; /* for SQ-delete scan */
+    uint64_t            wfq_v_clock;                            /* SCFQ virtual clock (monotone) */
+    uint64_t            wfq_f_last[CDL_MAX_CLASSES];            /* last finish tag per class */
+    QTAILQ_HEAD(, NvmeRequest) wfq_queues[CDL_MAX_CLASSES];     /* per-class ingestion FIFOs */
 
     volatile int64_t chip_next_avail_time[FEMU_MAX_NUM_CHIPS];
     pthread_spinlock_t chip_locks[FEMU_MAX_NUM_CHIPS];
@@ -2926,6 +2931,7 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, uint64_t len)
 
 /* TP4221 WFQ scheduler API — declared after both NvmeRequest and FemuCtrl */
 void wfq_init(FemuCtrl *n);
+void wfq_recompute_limits(FemuCtrl *n);
 void wfq_defer(FemuCtrl *n, NvmeRequest *req, int poller);
 void wfq_on_complete(FemuCtrl *n, NvmeRequest *req);
 
