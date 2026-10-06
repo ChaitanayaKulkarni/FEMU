@@ -526,6 +526,26 @@ static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
     n->bar.cc = 0;
     nvme_reset_features(n);
     n->temp_warn_issued = 0;
+
+    /* TP4221 CDL: full state reset per ABI §8 */
+    pthread_spin_lock(&n->cdl_lock);
+    n->cdl_enabled = false;
+    memset(n->cdl_read,  0, sizeof(n->cdl_read));
+    memset(n->cdl_write, 0, sizeof(n->cdl_write));
+    memset(n->cdl_stats, 0, sizeof(n->cdl_stats));
+    /*
+     * nvme_free_sq() sets n->sq[sqid]=NULL before freeing the struct, so
+     * every slot is already NULL here — the loop runs zero iterations and
+     * touches no freed memory.  Kept for completeness in case of partial
+     * teardown paths added in the future.
+     */
+    for (i = 1; i <= n->nr_io_queues; i++) {
+        if (n->sq[i]) {
+            n->sq[i]->cdl_class = 0;
+        }
+    }
+    pthread_spin_unlock(&n->cdl_lock);
+    wfq_init(n);
     /*
      * Release the doorbell buffers as well as forgetting them: each enable and
      * configure took a mapping reference that only the device going away gave
@@ -2394,6 +2414,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     pthread_spin_init(&n->pcie_lock, PTHREAD_PROCESS_PRIVATE);
     pthread_spin_init(&n->fw_cpu_lock, PTHREAD_PROCESS_PRIVATE);
     pthread_spin_init(&n->cdl_lock, PTHREAD_PROCESS_PRIVATE);
+    wfq_init(n);
 
     n->completed = 0;
     n->power_on_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);

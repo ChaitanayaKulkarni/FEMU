@@ -1457,7 +1457,9 @@ typedef struct NvmeLBAF {
 /* TP4221 CDL structs — sizes fixed by CDL_WFQ_ABI_v1.1.txt §4/§5 */
 
 #define CDL_MAX_CLASSES     8       /* classes 0-7; class 0 = bypass */
+#define CDL_MAX_CLASS_INDEX  (CDL_MAX_CLASSES - 1)   /* max valid class index = 7 */
 #define CDL_MAX_NS          100000000ULL  /* 100 ms in nanoseconds — max duration_ns */
+#define WFQ_SCALE           1000000ULL   /* fixed-point scale for virtual tags */
 #define CDL_LOG_PAGE_C0     0xc0    /* CDL class descriptor log */
 #define CDL_LOG_PAGE_C1     0xc1    /* CDL per-class statistics log */
 #define CDL_ABI_VERSION     1
@@ -1469,7 +1471,7 @@ typedef struct QEMU_PACKED NvmeCdlDescriptor {
     uint32_t    guide_ns;       /* informational guide latency */
     uint16_t    desc_gen;       /* descriptor generation; init=0, first set→1,
                                  * wraps 65535→1 (never wraps to 0) */
-    uint8_t     policy;         /* 0=complete, 1=abort on expiry */
+    uint8_t     policy;         /* 0=soft/report-only (v1); 1-3 reserved */
     uint8_t     reserved;
 } NvmeCdlDescriptor;
 
@@ -1516,11 +1518,11 @@ typedef struct QEMU_PACKED NvmeCdlLogPage0xC1 {
 
 /* CDL status codes (SCT=7h vendor-specific, assembled as (7<<9)|SC) */
 #define CDL_STATUS(sc)          (NVME_SCT_VENDOR_SPECIFIC << 9 | (sc))
-#define CDL_STATUS_BUSY         CDL_STATUS(0x01)    /* CDL busy, retry later */
-#define CDL_STATUS_BAD_DESC     CDL_STATUS(0x02)    /* invalid descriptor fields */
-#define CDL_STATUS_BAD_CLASS    CDL_STATUS(0x03)    /* class 0 or out of range */
-#define CDL_STATUS_BAD_SQID     CDL_STATUS(0x04)    /* SQID not found */
-#define CDL_STATUS_NOT_ENABLED  CDL_STATUS(0x05)    /* CDL not enabled */
+#define CDL_STATUS_BUSY               CDL_STATUS(0x01)  /* scheduler not idle */
+#define CDL_STATUS_DESCRIPTOR_NOT_SET CDL_STATUS(0x02)  /* bound class duration=0 */
+#define CDL_STATUS_INVALID_DURATION   CDL_STATUS(0x03)  /* DURATION=0 or >CDL_MAX_NS */
+#define CDL_STATUS_INVALID_POLICY     CDL_STATUS(0x04)  /* POLICY not 00b in v1 */
+#define CDL_STATUS_INVALID_CLASS      CDL_STATUS(0x05)  /* CLASS>MAXE2ECLASSES */
 
 #ifndef NVME_SCT_VENDOR_SPECIFIC
 #define NVME_SCT_VENDOR_SPECIFIC 0x7
@@ -1748,6 +1750,13 @@ typedef struct NvmeRequest {
      * puts it on that poller's completion ring when it is done.
      */
     void            (*defer)(FemuCtrl *n, struct NvmeRequest *req, int poller);
+
+    /* TP4221 WFQ scheduler fields — valid when wfq_cdl_class != 0 */
+    uint64_t        wfq_virt_finish;    /* SCFQ virtual finish tag F(c,k) */
+    int64_t         wfq_ingestion_ns;   /* QEMU_CLOCK_VIRTUAL at enqueue */
+    uint8_t         wfq_cdl_class;      /* class at ingestion; 0 = bypass */
+    int             wfq_poller_idx;     /* poller that submitted this request */
+    QTAILQ_ENTRY(NvmeRequest) wfq_entry; /* linkage in per-class FIFO */
 } NvmeRequest;
 
 typedef struct DMAOff {
@@ -2359,7 +2368,13 @@ typedef struct FemuCtrl {
     NvmeCdlDescriptor   cdl_read[CDL_MAX_CLASSES];          /* read class descriptors */
     NvmeCdlDescriptor   cdl_write[CDL_MAX_CLASSES];         /* write class descriptors */
     NvmeCdlClassStats   cdl_stats[CDL_MAX_CLASSES];         /* per-class miss/completion counters */
-    pthread_spinlock_t  cdl_lock;                           /* guards cdl_stats updates */
+    pthread_spinlock_t  cdl_lock;                           /* guards all CDL + WFQ state */
+
+    /* TP4221 WFQ scheduler state — protected by cdl_lock */
+    NvmeRequest        *wfq_in_flight;                      /* NULL or command in NAND (v1: single slot) */
+    uint64_t            wfq_v_clock;                        /* SCFQ virtual clock */
+    uint64_t            wfq_f_last[CDL_MAX_CLASSES];        /* last finish tag per class */
+    QTAILQ_HEAD(, NvmeRequest) wfq_queues[CDL_MAX_CLASSES]; /* per-class ingestion FIFOs */
 
     volatile int64_t chip_next_avail_time[FEMU_MAX_NUM_CHIPS];
     pthread_spinlock_t chip_locks[FEMU_MAX_NUM_CHIPS];
@@ -2908,5 +2923,10 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, uint64_t len)
 #define femu_log(fmt, ...) \
     do { printf("[FEMU] Log: " fmt, ## __VA_ARGS__); } while (0)
 
+
+/* TP4221 WFQ scheduler API — declared after both NvmeRequest and FemuCtrl */
+void wfq_init(FemuCtrl *n);
+void wfq_defer(FemuCtrl *n, NvmeRequest *req, int poller);
+void wfq_on_complete(FemuCtrl *n, NvmeRequest *req);
 
 #endif /* __FEMU_NVME_H */

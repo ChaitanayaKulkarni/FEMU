@@ -149,6 +149,32 @@ static uint16_t nvme_del_sq(FemuCtrl *n, NvmeCmd *cmd)
     }
 
     nvme_drain_sq(n, sq);
+
+    /* TP4221: drain WFQ class queues for deleted SQ */
+    pthread_spin_lock(&n->cdl_lock);
+    for (int cls = 1; cls < CDL_MAX_CLASSES; cls++) {
+        NvmeRequest *wreq, *wtmp;
+        QTAILQ_FOREACH_SAFE(wreq, &n->wfq_queues[cls], wfq_entry, wtmp) {
+            if (wreq->sq == sq) {
+                QTAILQ_REMOVE(&n->wfq_queues[cls], wreq, wfq_entry);
+                wreq->status = NVME_CMD_ABORT_SQ_DEL;
+                QTAILQ_INSERT_TAIL(&sq->req_list, wreq, entry);
+            }
+        }
+    }
+    /*
+     * If the single in-flight WFQ request belongs to this SQ, it has already
+     * been dequeued from to_ftl by the FTL thread and is not reachable by
+     * nvme_drain_sq().  Zero wfq_cdl_class before nvme_free_sq() reclaims
+     * the request storage so that the wfq_on_complete() early-return guard
+     * triggers when the FTL eventually posts the result to to_poller.
+     */
+    if (n->wfq_in_flight && n->wfq_in_flight->sq == sq) {
+        n->wfq_in_flight->wfq_cdl_class = 0;
+        n->wfq_in_flight = NULL;
+    }
+    pthread_spin_unlock(&n->cdl_lock);
+
     nvme_free_sq(sq, n);
     nvme_resume_pollers(n, resume);
 
@@ -1179,13 +1205,18 @@ static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
     switch (cdlop) {
     case CDL_CDLOP_ENABLE: {
         bool enable = !!(dw11 & 0x4);
-        /*
-         * ABI §3.1: scheduler must be idle (in_flight==NULL, all class
-         * queues empty) before toggling CDLE.  The idle check is enforced
-         * in Milestone C when the WFQ state machine exists.  Until then
-         * the controller is always idle so the precondition trivially holds.
-         */
         pthread_spin_lock(&n->cdl_lock);
+        bool idle = (n->wfq_in_flight == NULL);
+        for (int c = 1; c < CDL_MAX_CLASSES && idle; c++) {
+            idle = QTAILQ_EMPTY(&n->wfq_queues[c]);
+        }
+        if (!idle) {
+            pthread_spin_unlock(&n->cdl_lock);
+            return CDL_STATUS_BUSY;
+        }
+        if (enable) {
+            memset(n->cdl_stats, 0, sizeof(n->cdl_stats));
+        }
         n->cdl_enabled = enable;
         pthread_spin_unlock(&n->cdl_lock);
         break;
@@ -1195,7 +1226,7 @@ static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
         uint8_t sqid = (dw11 >> 16) & 0xff;
 
         if (sqid == 0 || sqid > n->nr_io_queues || !n->sq[sqid]) {
-            return CDL_STATUS_BAD_SQID;
+            return CDL_STATUS_INVALID_CLASS;
         }
         if (cls != 0) {
             pthread_spin_lock(&n->cdl_lock);
@@ -1203,7 +1234,7 @@ static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
                                n->cdl_write[cls].duration_ns > 0);
             pthread_spin_unlock(&n->cdl_lock);
             if (!configured) {
-                return CDL_STATUS_BAD_DESC;
+                return CDL_STATUS_DESCRIPTOR_NOT_SET;
             }
         }
         pthread_spin_lock(&n->cdl_lock);
@@ -1220,18 +1251,21 @@ static uint16_t nvme_cdl_set_feature(FemuCtrl *n, NvmeCmd *cmd, uint32_t dw11)
         uint8_t  policy = (cdw13 >> 2) & 0x3;
         uint32_t guide  = le32_to_cpu(cmd->cdw14);
 
-        if (cls == 0 || cls >= CDL_MAX_CLASSES) {
-            return CDL_STATUS_BAD_CLASS;
-        }
-        if (policy != 0) {
+        if (cls == 0) {
             return NVME_INVALID_FIELD | NVME_DNR;
         }
+        if (cls >= CDL_MAX_CLASSES) {
+            return CDL_STATUS_INVALID_CLASS;
+        }
+        if (policy != 0) {
+            return CDL_STATUS_INVALID_POLICY;
+        }
         if (dur == 0) {
-            return CDL_STATUS_BAD_CLASS;
+            return CDL_STATUS_INVALID_DURATION;
         }
         uint64_t duration_ns = (uint64_t)dur * tfu_mult[tfu];
         if (duration_ns > CDL_MAX_NS) {
-            return CDL_STATUS_BAD_CLASS;
+            return CDL_STATUS_INVALID_DURATION;
         }
         uint64_t guide_ns = (uint64_t)guide * tfu_mult[tfu];
 
@@ -1263,10 +1297,26 @@ static uint16_t nvme_cdl_get_feature(FemuCtrl *n, uint32_t dw11, NvmeCqe *cqe)
     case CDL_CDLOP_BIND: {
         uint8_t sqid = (dw11 >> 16) & 0xff;
         if (sqid == 0 || sqid > n->nr_io_queues || !n->sq[sqid]) {
-            return CDL_STATUS_BAD_SQID;
+            return CDL_STATUS_INVALID_CLASS;
         }
         cqe->n.result = cpu_to_le32(n->sq[sqid]->cdl_class);
         break;
+    }
+    case CDL_CDLOP_SET_DESC: {
+        uint8_t cls   = (dw11 >> 8) & 0x7;
+        bool    is_wr = !!(dw11 & (1u << 11));
+        if (cls == 0 || cls >= CDL_MAX_CLASSES) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        pthread_spin_lock(&n->cdl_lock);
+        NvmeCdlDescriptor *desc = is_wr ? &n->cdl_write[cls] : &n->cdl_read[cls];
+        uint32_t res = (uint32_t)desc->desc_gen
+                     | ((uint32_t)(desc->policy & 0xf) << 16)
+                     | (desc->guide_ns ? (1u << 20) : 0u)
+                     | (is_wr ? (1u << 21) : 0u);
+        pthread_spin_unlock(&n->cdl_lock);
+        cqe->n.result = cpu_to_le32(res);
+        return NVME_SUCCESS;
     }
     default:
         return NVME_INVALID_FIELD | NVME_DNR;
@@ -2010,6 +2060,8 @@ static uint16_t nvme_supported_log_pages(FemuCtrl *n, NvmeCmd *cmd,
         lids[NVME_LOG_SANITIZE] = cpu_to_le32(NVME_LIDS_LSUPP);
     }
     lids[NVME_LOG_FEMU_STATS]   = cpu_to_le32(NVME_LIDS_LSUPP);
+    lids[CDL_LOG_PAGE_C0]       = cpu_to_le32(NVME_LIDS_LSUPP);
+    lids[CDL_LOG_PAGE_C1]       = cpu_to_le32(NVME_LIDS_LSUPP);
 
     if (n->subsys) {
         lids[NVME_LOG_ENDGRP]        = cpu_to_le32(NVME_LIDS_LSUPP);
@@ -3017,6 +3069,58 @@ static uint16_t nvme_sanitize_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
                         le64_to_cpu(cmd->dptr.prp2));
 }
 
+/* TP4221: Log Page 0xC0 — CDL class descriptor table (512 bytes) */
+static uint16_t nvme_cdl_log_c0(FemuCtrl *n, NvmeCmd *cmd,
+                                 uint32_t buf_len, uint64_t off)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    NvmeCdlLogPage0xC0 pg;
+    uint32_t trans_len;
+
+    if (off >= sizeof(pg)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    memset(&pg, 0, sizeof(pg));
+    pg.page_version = cpu_to_le16(CDL_PAGE_VERSION);
+    pg.num_classes  = cpu_to_le16(CDL_MAX_CLASS_INDEX);
+    pg.cdl_version  = CDL_ABI_VERSION;
+
+    pthread_spin_lock(&n->cdl_lock);
+    pg.cdl_flags = n->cdl_enabled ? 0x1 : 0x0;
+    memcpy(pg.read,  n->cdl_read,  sizeof(pg.read));
+    memcpy(pg.write, n->cdl_write, sizeof(pg.write));
+    pthread_spin_unlock(&n->cdl_lock);
+
+    trans_len = MIN(sizeof(pg) - off, buf_len);
+    return dma_read_prp(n, (uint8_t *)&pg + off, trans_len, prp1, prp2);
+}
+
+/* TP4221: Log Page 0xC1 — CDL per-class statistics (256 bytes) */
+static uint16_t nvme_cdl_log_c1(FemuCtrl *n, NvmeCmd *cmd,
+                                 uint32_t buf_len, uint64_t off)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    NvmeCdlLogPage0xC1 pg;
+    uint32_t trans_len;
+
+    if (off >= sizeof(pg)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    memset(&pg, 0, sizeof(pg));
+    pg.version = cpu_to_le16(CDL_ABI_VERSION);
+
+    pthread_spin_lock(&n->cdl_lock);
+    memcpy(pg.stats, n->cdl_stats, sizeof(pg.stats));
+    pthread_spin_unlock(&n->cdl_lock);
+
+    trans_len = MIN(sizeof(pg) - off, buf_len);
+    return dma_read_prp(n, (uint8_t *)&pg + off, trans_len, prp1, prp2);
+}
+
 static uint16_t nvme_get_log(FemuCtrl *n, NvmeCmd *cmd)
 {
     uint32_t dw10 = le32_to_cpu(cmd->cdw10);
@@ -3113,6 +3217,10 @@ static uint16_t nvme_get_log(FemuCtrl *n, NvmeCmd *cmd)
         return nvme_fdp_stats(n, lspi, len, off, cmd);
     case NVME_LOG_FDP_EVENTS:
         return nvme_fdp_events(n, lspi, len, off, cmd);
+    case CDL_LOG_PAGE_C0:
+        return nvme_cdl_log_c0(n, cmd, len, off);
+    case CDL_LOG_PAGE_C1:
+        return nvme_cdl_log_c1(n, cmd, len, off);
     default: {
         /*
          * A namespace-specific log page belongs to the mode that namespace

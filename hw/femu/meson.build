@@ -1,6 +1,6 @@
 system_ss.add(when: 'CONFIG_FEMU_PCI',
               if_true: files('dma.c', 'intr.c', 'nvme-util.c',
-                             'nvme-admin.c', 'nvme-io.c', 'nvme-pi.c',
+                             'nvme-admin.c', 'nvme-io.c', 'nvme-wfq.c', 'nvme-pi.c',
                              'nvme-pel.c', 'nvme-streams.c', 'femu.c',
                              'femu-props.c',
                              'nossd/nop.c', 'nand/nand.c',

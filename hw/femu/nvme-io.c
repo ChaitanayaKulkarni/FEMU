@@ -333,6 +333,18 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         }
 
         /*
+         * TP4221 WFQ gate: if CDL is enabled and the SQ is bound to a class,
+         * defer through the WFQ scheduler instead of going straight to FTL.
+         * Only read/write commands carry duration limits; others bypass.
+         */
+        if (status == NVME_SUCCESS && n->cdl_enabled && sq->cdl_class != 0 &&
+            (req->cmd_opcode == NVME_CMD_READ ||
+             req->cmd_opcode == NVME_CMD_WRITE)) {
+            req->wfq_cdl_class = 0; /* cleared; wfq_defer will set it */
+            req->defer = wfq_defer;
+        }
+
+        /*
          * The host-link and controller-CPU models are applied on the ring
          * path, so a request that should pay them cannot complete inline.
          */
@@ -524,6 +536,12 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         }
 
         pqueue_pop(pq);
+
+        /* TP4221: CDL miss detection and WFQ slot release */
+        if (req->wfq_cdl_class) {
+            wfq_on_complete(n, req);
+        }
+
         /*
          * A submission queue names the completion queue it reports to, and the
          * two need not share a number. Indexing by the submission queue's own
