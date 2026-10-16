@@ -1460,14 +1460,12 @@ typedef struct NvmeLBAF {
 #define CDL_MAX_CLASSES           256     /* class IDs 0-255; 0 is bypass */
 #define CDL_POLICY_BEST_EFFORT    0x02
 #define CDL_LOG_PAGE_C0           0xc0
-#define CDL_LOG_PAGE_C1           0xc1
 #define CDL_IDENTIFY_MAJOR        2
-#define CDL_IDENTIFY_MINOR        1
+#define CDL_IDENTIFY_MINOR        2
 #define CDL_LOG_MAJOR             2
-#define CDL_LOG_MINOR             0
+#define CDL_LOG_MINOR             1
 #define CDL_LOG_HEADER_BYTES      64
 #define CDL_CONFIG_ENTRY_BYTES    16
-#define CDL_STATS_ENTRY_BYTES     24
 #define CDL_IDENTIFY_VS_OFFSET    0
 #define CDL_IDENTIFY_HEADER_BYTES 64
 #define CDL_IDENTIFY_FLAGS        3
@@ -1491,7 +1489,7 @@ typedef struct QEMU_PACKED NvmeCdlIdentify {
     uint16_t classes;
     uint8_t fid;
     uint8_t config_lid;
-    uint8_t stats_lid;
+    uint8_t reserved18;
     uint8_t policy;
     uint32_t flags;
     uint8_t tag[8];
@@ -1507,13 +1505,6 @@ typedef struct NvmeCdlDescriptor {
     uint32_t duration_us;        /* zero means unconfigured */
     uint8_t policy;              /* CDL_POLICY_BEST_EFFORT when configured */
 } NvmeCdlDescriptor;
-
-typedef struct NvmeCdlClassStats {
-    uint64_t timed;
-    uint64_t misses;
-    bool timed_saturated;
-    bool misses_saturated;
-} NvmeCdlClassStats;
 
 /* qtest-only virtual-time and durable-store injection points. */
 typedef enum NvmeCdlTestDelay {
@@ -1803,8 +1794,6 @@ typedef struct NvmeRequest {
     uint64_t        wfq_virt_finish;
     uint64_t        cdl_attempt;
     int64_t         cdl_start_ns;
-    int64_t         cdl_stop_ns;
-    int64_t         cdl_elapsed_ns;
     uint64_t        cdl_duration_ns;
     uint8_t         wfq_cdl_class;
     uint8_t         cdl_policy;
@@ -1814,8 +1803,6 @@ typedef struct NvmeRequest {
     bool            cdl_executed;
     bool            cdl_timed;
     bool            cdl_checked;
-    bool            cdl_miss;
-    bool            cdl_accounted;
     bool            cdl_cq_delay_applied;
     bool            wfq_orphaned;
     QTAILQ_ENTRY(NvmeRequest) wfq_entry;
@@ -2443,11 +2430,8 @@ typedef struct FemuCtrl {
     NvmeCdlDescriptor   *cdl_desc;
     NvmeCdlDescriptor   *cdl_saved_desc;
     bool                *cdl_saved_desc_present;
-    NvmeCdlClassStats   *cdl_stats;
     uint32_t            *cdl_assoc;
     uint64_t            cdl_generation;
-    uint64_t            cdl_snapshot_seq;
-    uint64_t            cdl_last_txid;
     uint8_t             cdl_store_id[16];
     char                cdl_trace_id[33];
     uint64_t            cdl_attempt_seq;
@@ -3049,9 +3033,6 @@ void cdl_exit(FemuCtrl *n);
 void cdl_reset(FemuCtrl *n);
 bool cdl_save_state(FemuCtrl *n, Error **errp);
 bool cdl_check(FemuCtrl *n, NvmeRequest *req);
-#define CDL_ACCOUNT_BATCH 64
-bool cdl_account_many(FemuCtrl *n, NvmeRequest **reqs, unsigned count);
-bool cdl_account(FemuCtrl *n, NvmeRequest *req);
 uint16_t nvme_cdl_execute(FemuCtrl *n, NvmeRequest *req);
 int64_t nvme_io_clock(FemuCtrl *n);
 void nvme_apply_service_delay(FemuCtrl *n, NvmeRequest *req);

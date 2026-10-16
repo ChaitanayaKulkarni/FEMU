@@ -335,8 +335,6 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->cdl_executed = false;
         req->cdl_timed = false;
         req->cdl_checked = false;
-        req->cdl_miss = false;
-        req->cdl_accounted = false;
         req->cdl_cq_delay_applied = false;
         /* Coperd: record req->stime at earliest convenience */
         req->expire_time = req->stime = nvme_io_clock(n);

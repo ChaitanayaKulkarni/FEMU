@@ -1,7 +1,7 @@
 # Experimental TP4221 CDL queue capacities
 
 FEMU exports a 64-byte Identify Controller vendor header at bytes 3072–3135:
-Identify profile 2.1, separate from the unchanged CDL log format 2.0. All existing
+Identify profile 2.2 with configuration log format 2.1; CDL statistics are removed. All existing
 standard Identify offsets and the 4096-byte size are preserved. This is a local
 experimental assignment, not a ratified NVMe allocation.
 
@@ -55,62 +55,26 @@ and log images, verifies the 20-pair layout, then provisions all 52 pairs to tes
 the advertised maximum. The local conformance contract defines T23–T26 in addition
 to T1–T22.
 
-## Timed NAND execution and durable accounting
+## No CDL statistics on the I/O path (2026-10-16)
 
-Use `femu_mode=1` (BBSSD) for full NAND execution and performance work. The
-Identify-only example above uses NoSSD as a small discovery fixture; it is not
-a performance configuration. The experiment launcher in `cdl-google-exp1/run.py`
-supplies the complete BBSSD geometry, kernel profile and fio workload.
+CDL timed/miss counters, saturation flags, statistics snapshots and accounting
+journals have been removed. Identify2.2 byte3090 is reserved zero. C1h is not
+advertised and reading it returns Invalid Log Page. C0h is configuration-only
+format2.1 with header48..63 reserved zero. Update the kernel together with FEMU.
 
-The controller FTL worker issues a bounded set of requests without sleeping
-through each modeled NAND latency. Executed timed requests remain owned by the
-FTL pending list until their modeled completion time. The worker freezes all
-ready timing results before starting durable accounting. Completion-ring
-backpressure retains those owners and cannot cause a second check or count.
-Delete and reset use the existing poller/FTL pause handshake to retire them.
+The FTL worker pipelines modeled NAND service and keeps ready request ownership
+until completion-ring delivery. It checks/releases each timed request once;
+there is no accounting transaction, accounting mutex, file write, fsync, rename
+or directory sync on completion. Optional per-command traces diagnose the flow.
+Dispatch telemetry and fault/delay fixtures are active in qtest processes only.
 
-Already-ready results share one durable transaction, with at most 64 members.
-No command waits for a batch to fill. Every member receives its own contiguous
-transaction ID and counter update; all members are durable before any of their
-CQEs may be published. Persistence failure sets CFS and suppresses delivery.
-The `femu_cdl_persist_latency` trace reports native wall time and batch size;
-this measures host filesystem cost, separately from the controller timer.
-Its elapsed value covers the shared transaction and must not be summed once
-per member as if each member performed a separate store operation.
+Saved administrative configuration still uses SV/SEL and a configuration-only
+version3 store. Older statistics-bearing stores are rejected and preserved;
+use a fresh store path. Data I/O never writes that configuration file.
 
-The main checkpoint format and NVMe wire formats are unchanged. A single
-request still uses the existing 96-byte version-3 `CDL2TXN` intent. Multiple
-requests use a private version-4 `CDL2BTX` envelope in the same `.txn` path:
-
-| Offset | Bytes | Value |
-|---|---:|---|
-| 0 | 8 | `CDL2BTX` followed by NUL |
-| 8 | 4 | LE32 version 4 |
-| 12 | 4 | LE32 member count, 2 through 64 |
-| 16 | 8 | LE64 first transaction ID |
-| 24 | 8 | Reserved, zero |
-| 32 | 32 | SHA-256 of bytes 0–31 followed by bytes 64–end |
-| 64 | 96 × count | Individually checksummed version-3 member records |
-
-Recovery validates the complete envelope and every member, including store
-identity and contiguous nonwrapping transaction IDs, before changing counters.
-Only members newer than the checkpoint are applied. One new checkpoint covers
-the recovered suffix; replaying the same journal cannot recount its members.
-Malformed evidence is preserved and controller realization fails. An older
-FEMU binary cannot replay a pending version-4 envelope: use the new binary for
-recovery before attempting a downgrade, and retain backups of controller state.
-
-Run the existing fault tests normally and the BBSSD batch fault variants in a
-separate discovery pass (libqos has a fixed graph stack):
-
-```sh
-python3 hw/femu/tests/cdl-conformance.py --build build-perf --output <fresh-dir> \
-  --pty --batch-store-faults --match cdl-batch-fault-
-```
-
-The batch fixtures hold the first backend owner until twelve commands have
-been dispatched, inject each existing persistence failure, verify CFS and no
-CQEs, and inspect any published intent for all twelve members. Run
-`cdl-google-exp1/batch-recovery-test.py` separately for actual process-restart
-recovery of valid and malformed envelopes. These are controller checks; the
-fio same-CPU hint-swap audit supplies the separate kernel routing evidence.
+Default current-profile qtest `cdl-no-statistics` exercises32 cross-class BBSSD
+writes/reads with exact data checks while a configuration-write failure is armed.
+It requires an unchanged configuration file and no journal. Historical statistics
+fixtures are outside default discovery. This gate does not claim full scheduler
+conformance. The guest fio smoke independently checks256 CRC-verified reads,
+explicit priority and same-CPU hint swaps through the kernel and NAND backend.

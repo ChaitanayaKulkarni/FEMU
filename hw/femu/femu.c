@@ -1715,7 +1715,6 @@ static void nvme_init_ctrl(FemuCtrl *n)
         stw_le_p(profile + 14, n->cdl_num_classes);
         profile[16] = NVME_CDL_CFG;
         profile[17] = CDL_LOG_PAGE_C0;
-        profile[18] = CDL_LOG_PAGE_C1;
         profile[19] = CDL_POLICY_BEST_EFFORT;
         stl_le_p(profile + 20, CDL_IDENTIFY_FLAGS);
         memcpy(profile + 24, "TP4221V2", 8);
@@ -1880,10 +1879,8 @@ static uint64_t femu_ftl_process_req(FemuCtrl *n, NvmeRequest *req)
 static void femu_ftl_complete_pending(FemuCtrl *n)
 {
     NvmeRequest *req, *next;
-    NvmeRequest *batch[CDL_ACCOUNT_BATCH];
-    unsigned count = 0;
 
-    /* Freeze all ready results before any durable store operation can block. */
+    /* Complete modeled NAND work without statistics or host filesystem I/O. */
     QTAILQ_FOREACH(req, &n->ftl_pending, entry) {
         if (req->cdl_checked || nvme_io_clock(n) < req->expire_time) {
             continue;
@@ -1896,21 +1893,6 @@ static void femu_ftl_complete_pending(FemuCtrl *n)
             return;
         }
     }
-    QTAILQ_FOREACH(req, &n->ftl_pending, entry) {
-        if (!req->cdl_checked || req->cdl_accounted) {
-            continue;
-        }
-        batch[count++] = req;
-        if (count == ARRAY_SIZE(batch)) {
-            if (!cdl_account_many(n, batch, count)) {
-                return;
-            }
-            count = 0;
-        }
-    }
-    if (count && !cdl_account_many(n, batch, count)) {
-        return;
-    }
     QTAILQ_FOREACH_SAFE(req, &n->ftl_pending, entry, next) {
         int poller;
 
@@ -1921,7 +1903,6 @@ static void femu_ftl_complete_pending(FemuCtrl *n)
         if (!req->cdl_checked) {
             continue;
         }
-        assert(req->cdl_accounted);
         poller = req->wfq_poller_idx;
         QTAILQ_REMOVE(&n->ftl_pending, req, entry);
         qatomic_dec(&n->ftl_pending_count);

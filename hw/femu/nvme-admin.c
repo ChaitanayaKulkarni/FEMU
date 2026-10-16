@@ -2124,7 +2124,6 @@ static uint16_t nvme_supported_log_pages(FemuCtrl *n, NvmeCmd *cmd,
     lids[NVME_LOG_FEMU_STATS]   = cpu_to_le32(NVME_LIDS_LSUPP);
     if (n->cdl_profile) {
         lids[CDL_LOG_PAGE_C0] = cpu_to_le32(NVME_LIDS_LSUPP);
-        lids[CDL_LOG_PAGE_C1] = cpu_to_le32(NVME_LIDS_LSUPP);
     }
 
     if (n->subsys) {
@@ -3134,14 +3133,13 @@ static uint16_t nvme_sanitize_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
 }
 
 static uint16_t nvme_cdl_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
-                             uint64_t off, bool statistics)
+                             uint64_t off)
 {
     uint32_t dw10 = le32_to_cpu(cmd->cdw10);
     uint32_t dw11 = le32_to_cpu(cmd->cdw11);
     uint32_t nsid = le32_to_cpu(cmd->nsid);
     uint32_t cdw14 = le32_to_cpu(cmd->cdw14);
-    uint16_t entry_bytes = statistics ? CDL_STATS_ENTRY_BYTES :
-                                        CDL_CONFIG_ENTRY_BYTES;
+    uint16_t entry_bytes = CDL_CONFIG_ENTRY_BYTES;
     uint32_t logical = CDL_LOG_HEADER_BYTES +
                        n->cdl_num_classes * entry_bytes;
     g_autofree uint8_t *image = NULL;
@@ -3160,9 +3158,6 @@ static uint16_t nvme_cdl_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
     image = g_malloc0(logical);
     out = g_malloc0(buf_len);
     pthread_spin_lock(&n->cdl_lock);
-    if (n->cdl_snapshot_seq != UINT64_MAX) {
-        n->cdl_snapshot_seq++;
-    }
     memcpy(image, "CDL2", 4);
     stw_le_p(image + 4, CDL_LOG_MAJOR);
     stw_le_p(image + 6, CDL_LOG_MINOR);
@@ -3174,7 +3169,6 @@ static uint16_t nvme_cdl_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
                            (n->cdl_saved_enabled_present ? 2u : 0u));
     stq_le_p(image + 24, n->cdl_generation);
     memcpy(image + 32, n->cdl_store_id, sizeof(n->cdl_store_id));
-    stq_le_p(image + 48, n->cdl_snapshot_seq);
 
     for (uint32_t c = 0; c < n->cdl_num_classes; c++) {
         uint8_t *entry = image + CDL_LOG_HEADER_BYTES + c * entry_bytes;
@@ -3183,14 +3177,7 @@ static uint16_t nvme_cdl_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
         if (!c) {
             continue;
         }
-        if (statistics) {
-            NvmeCdlClassStats *stats = &n->cdl_stats[c];
-
-            entry[1] = (stats->timed_saturated ? 1u : 0u) |
-                       (stats->misses_saturated ? 2u : 0u);
-            stq_le_p(entry + 8, stats->timed);
-            stq_le_p(entry + 16, stats->misses);
-        } else {
+        {
             NvmeCdlDescriptor *desc = &n->cdl_desc[c];
 
             entry[1] = (desc->duration_us ? 1u : 0u) |
@@ -3202,8 +3189,8 @@ static uint16_t nvme_cdl_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
     pthread_spin_unlock(&n->cdl_lock);
 
     copy = MIN((uint64_t)buf_len, (uint64_t)logical - off);
-    image[n->cdl_test_log_xor_offset[statistics]] ^=
-        n->cdl_test_log_xor_value[statistics];
+    image[n->cdl_test_log_xor_offset[0]] ^=
+        n->cdl_test_log_xor_value[0];
     memcpy(out, image + off, copy);
     return dma_read_prp(n, out, buf_len, le64_to_cpu(cmd->dptr.prp1),
                         le64_to_cpu(cmd->dptr.prp2));
@@ -3331,9 +3318,7 @@ static uint16_t nvme_get_log(FemuCtrl *n, NvmeCmd *cmd)
     case NVME_LOG_FDP_EVENTS:
         return nvme_fdp_events(n, lspi, len, off, cmd);
     case CDL_LOG_PAGE_C0:
-        return nvme_cdl_log(n, cmd, len, off, false);
-    case CDL_LOG_PAGE_C1:
-        return nvme_cdl_log(n, cmd, len, off, true);
+        return nvme_cdl_log(n, cmd, len, off);
     default: {
         /*
          * A namespace-specific log page belongs to the mode that namespace

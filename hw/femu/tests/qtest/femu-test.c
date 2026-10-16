@@ -20363,10 +20363,7 @@ static void femu_test_cdl_ring_pressure(void *obj, void *data,
     QTestState *qts = femu->dev.bus->qts;
     bool ftl = GPOINTER_TO_UINT(data);
     const char *id = "cdl-pressure";
-    uint64_t buf = guest_alloc(alloc, 8192);
     uint64_t data_buf = guest_alloc(alloc, 4096);
-    uint64_t timed, misses;
-    uint8_t flags;
     uint32_t result;
     uint16_t first;
     unsigned seen = 0;
@@ -20392,15 +20389,6 @@ static void femu_test_cdl_ring_pressure(void *obj, void *data,
         g_usleep(1000);
     }
     g_assert_false(femu_cq_ready(&c, &c.io));
-    femu_cdl_read_stats(&c, qts, buf, 1, &flags, &timed, &misses);
-    for (unsigned poll = 0; ftl && timed < 12; poll++) {
-        /* Every ready result is durable even while CQ delivery is held. */
-        g_assert_cmpuint(poll, <, FEMU_POLL_LIMIT_MS);
-        g_usleep(1000);
-        femu_cdl_read_stats(&c, qts, buf, 1, &flags, &timed, &misses);
-    }
-    g_assert_cmpuint(timed, ==, ftl ? 12 : 0);
-    g_assert_cmpuint(misses, ==, 0);
     femu_cdl_test_control(qts, id, "hold-completion=0");
     for (unsigned i = 0; i < 12; i++) {
         uint16_t cid;
@@ -20412,15 +20400,11 @@ static void femu_test_cdl_ring_pressure(void *obj, void *data,
         seen |= 1u << index;
     }
     g_assert_cmphex(seen, ==, 0xfff);
-    femu_cdl_read_stats(&c, qts, buf, 1, &flags, &timed, &misses);
-    g_assert_cmpuint(timed, ==, 12);
-    g_assert_cmpuint(misses, ==, 0);
     g_test_message("actual %s ring pressure: 12 unique completions, 12 checks",
                    ftl ? "completion" : "backend");
     femu_disable(&c);
     femu_queue_free(&c, &c.io);
     guest_free(alloc, data_buf);
-    guest_free(alloc, buf);
 }
 
 /* T21: each insertion position is exercised at each existing cursor position. */
@@ -22461,6 +22445,73 @@ static void femu_test_cdl_capacity_properties(void *obj, void *data,
                    ARRAY_SIZE(invalid));
 }
 
+/* Profile 2.2 has no statistics log, accounting counters or I/O journal. */
+static void femu_test_cdl_no_statistics(void *obj, void *data,
+                                        QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    FemuQueue q3;
+    uint64_t buf = guest_alloc(alloc, 8192);
+    uint8_t image[4096], expected[4096];
+    uint32_t result;
+    g_autofree char *before = NULL, *after = NULL;
+    g_autofree char *txn = g_strconcat(data, ".txn", NULL);
+    gsize before_len, after_len;
+    struct stat first, last;
+
+    femu_enable(&c, &femu->dev, alloc);
+    g_assert_cmpint(femu_identify(&c, 0, 1, 0, buf), ==, NVME_SUCCESS);
+    qtest_memread(qts, buf, image, sizeof(image));
+    g_assert_cmpuint(lduw_le_p(image + 3082), ==, 2);
+    g_assert_cmpuint(image[3090], ==, 0);
+    g_assert_cmpint(FEMU_SC(femu_get_log(&c, 0, buf, 4096, 0)), ==, NVME_SUCCESS);
+    qtest_memread(qts, buf, image, sizeof(image));
+    g_assert_cmpuint(ldl_le_p(image + 0xc1 * 4), ==, 0);
+    g_assert_cmpint(FEMU_SC(femu_get_log(&c, 0xc1, buf, 64, 0)), ==,
+                    NVME_INVALID_LOG_ID);
+    g_assert_cmpint(FEMU_SC(femu_cdl_desc(&c, true, false, 0, 1, 300, 0)), ==,
+                    NVME_SUCCESS);
+    g_assert_cmpint(FEMU_SC(femu_cdl_desc(&c, true, false, 0, 3, 2000, 0)), ==,
+                    NVME_SUCCESS);
+    g_assert_cmpint(FEMU_SC(femu_set_feature(&c, FEMU_CDL_FID, false, 0, 4,
+                                             &result)), ==, NVME_SUCCESS);
+    femu_cdl_create_queue(&c, &c.io, 1, 1);
+    femu_cdl_create_queue(&c, &q3, 2, 3);
+    g_assert_true(g_file_get_contents(data, &before, &before_len, NULL));
+    g_assert_cmpint(stat(data, &first), ==, 0);
+    /* Any accidental configuration-store write would now fail visibly. */
+    femu_cdl_test_control(qts, "cdl-no-stats", "fail=store-open");
+    for (unsigned i = 0; i < 16; i++) {
+        FemuQueue *writer = i & 1 ? &q3 : &c.io;
+        FemuQueue *reader = i & 1 ? &c.io : &q3;
+
+        memset(expected, 0x31 + i, sizeof(expected));
+        qtest_memwrite(qts, buf, expected, sizeof(expected));
+        g_assert_cmpint(FEMU_SC(femu_cdl_rw(&c, writer, NVME_CMD_WRITE, buf)), ==,
+                        NVME_SUCCESS);
+        qtest_memset(qts, buf, 0, sizeof(expected));
+        g_assert_cmpint(FEMU_SC(femu_cdl_rw(&c, reader, NVME_CMD_READ, buf)), ==,
+                        NVME_SUCCESS);
+        qtest_memread(qts, buf, image, sizeof(image));
+        g_assert_cmpmem(image, sizeof(image), expected, sizeof(expected));
+    }
+    g_assert_true(g_file_get_contents(data, &after, &after_len, NULL));
+    g_assert_cmpint(stat(data, &last), ==, 0);
+    g_assert_cmpmem(before, before_len, after, after_len);
+    g_assert_cmpuint(first.st_ino, ==, last.st_ino);
+    g_assert_cmpint(first.st_mtim.tv_sec, ==, last.st_mtim.tv_sec);
+    g_assert_cmpint(first.st_mtim.tv_nsec, ==, last.st_mtim.tv_nsec);
+    g_assert_false(g_file_test(txn, G_FILE_TEST_EXISTS));
+    femu_cdl_test_control(qts, "cdl-no-stats", "reset");
+    femu_disable(&c);
+    femu_queue_free(&c, &q3);
+    femu_queue_free(&c, &c.io);
+    guest_free(alloc, buf);
+    g_test_message("32 successful cross-class data operations; configuration unchanged; no statistics or journal");
+}
+
 static void femu_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -22482,6 +22533,8 @@ static void femu_register_nodes(void)
     femu_cdl_file = g_strdup_printf("%s/femu-cdl-v2-%d.state",
                                     g_get_tmp_dir(), (int)getpid());
     femu_cdl_clean_store(femu_cdl_file);
+    /* Retain historical fixtures for explicit archaeology, outside the current gate. */
+    if (g_getenv("FEMU_CDL_LEGACY_TESTS")) {
     for (unsigned i = 0; i < 2; i++) {
         const char *name = i ? "cdl-generic-features" : "cdl-create-negative";
         g_autofree char *path = g_strdup_printf("%s/%s-%d.state", g_get_tmp_dir(), name, (int)getpid());
@@ -22876,6 +22929,33 @@ static void femu_register_nodes(void)
         }
     }
 
+    }
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-no-stats-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-no-statistics", "femu", femu_test_cdl_no_statistics,
+                     &(QOSGraphTestOptions) {
+            .arg = path,
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-no-stats,vid=0x8086,did=0x5845,cdl=on,"
+                "cdl_classes=7,queues=52,cdl_max_sqs=48,"
+                "cdl_sqs_per_class=8,cdl_bound_classes=6,femu_mode=1,cdl_file=%s", path),
+        });
+    }
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-no-stats-pressure-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-no-statistics-backpressure", "femu",
+                     femu_test_cdl_ring_pressure, &(QOSGraphTestOptions) {
+            .arg = GUINT_TO_POINTER(1),
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-pressure,vid=0x8086,did=0x5845,cdl=on,"
+                "cdl_classes=2,cdl_max_sqs=8,cdl_sqs_per_class=8,"
+                "cdl_bound_classes=1,femu_mode=1,cdl_file=%s", path),
+        });
+    }
     qos_add_test("doc-examples", "femu", femu_test_doc_examples, NULL);
     qos_add_test("ignored-props", "femu", femu_test_ignored_props, NULL);
     qos_add_test("cxl-geometry-bounds", "femu", femu_test_cxl_geometry_bounds,

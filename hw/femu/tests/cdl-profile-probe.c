@@ -20,7 +20,7 @@ static int read_image(const char *path, uint8_t *image, size_t length)
 int main(int argc, char **argv)
 {
     uint8_t id[4096];
-    uint8_t *config = NULL, *stats = NULL;
+    uint8_t *config = NULL;
     uint16_t classes;
     uint32_t total;
     char *end;
@@ -45,19 +45,12 @@ int main(int argc, char **argv)
         return 1;
     }
     size_t config_len = 64 + (size_t)classes * 16;
-    size_t stats_len = 64 + (size_t)classes * 24;
     config = malloc(config_len);
-    stats = malloc(stats_len);
-    if (!config || !stats || read_image(argv[2], config, config_len) ||
-        read_image(argv[3], stats, stats_len)) {
+    if (!config || read_image(argv[2], config, config_len)) {
         free(config);
-        free(stats);
         return 2;
     }
-    int invalid = validate_header(config, CDL_CONFIG_LID, classes, 16, &total) ||
-                  validate_header(stats, CDL_STATS_LID, classes, 24, &total) ||
-                  memcmp(config + 32, stats + 32, 16);
+    int invalid = validate_header(config, CDL_CONFIG_LID, classes, 16, &total);
     free(config);
-    free(stats);
     return invalid ? 1 : 0;
 }

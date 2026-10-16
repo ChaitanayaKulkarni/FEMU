@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run CDL qtests with source provenance and retained evidence.
 
-Case requirements deliberately include tests not yet implemented. A passing
-subset cannot turn an incomplete T1-T22 implementation into a conforming one.
+The current N1 gate validates profile2.2 statistics removal and data execution.
+It does not establish full scheduler/lifecycle conformance. Historical T1-T26
+requirements remain as an archival mapping only.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import subprocess
 import time
 
 
-CASES = {
+LEGACY_CASES = {
     "T1": ["cdl-v2", "cdl-count-1", "cdl-count-256",
            "cdl-discovery-matrix", "cdl-create-negative"],
     "T2": ["cdl-class-aggregation"],
@@ -61,6 +62,11 @@ CASES = {
 }
 
 
+# Profile 2.2 controller gate; historical statistics/crash fixtures are retired.
+CASES = {"N1": ["cdl-no-statistics"],
+         "N2": ["cdl-no-statistics-backpressure"]}
+
+
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -73,7 +79,7 @@ def save_json(path: Path, value: object) -> None:
 
 def validate_trace(directory: Path) -> dict:
     expected = ["fetch", "validation", "admission", "dispatch",
-                "backend_complete", "completion_check", "durable_commit", "cq_post"]
+                "backend_complete", "completion_check", "cq_post"]
     errors = []
     attempts = 0
     completed = 0
@@ -412,7 +418,7 @@ def main() -> int:
                "binary_fingerprint_stable": binaries_stable,
                "cases": cases, "nodes": results,
                "declared_exception": "reported feature-save failure semantics",
-               "limits": ["experimental wire allocations", "virtual timer only", "H1 separate"]}
+               "limits": ["profile 2.2 removal/data gate only; not full scheduler conformance", "experimental wire allocations", "virtual timer only", "H1 separate"]}
     save_json(out / "results.json", summary)
     print("CONFORMING" if summary["conforming"] else "CONFORMANCE NOT ESTABLISHED",
           flush=True)

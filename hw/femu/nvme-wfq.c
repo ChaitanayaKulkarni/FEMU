@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* TP4221 CDL v2 scheduling, timing, and persistent accounting. */
+/* TP4221 CDL v2 scheduling, timing, and saved configuration. */
 
 #include "nvme.h"
 #include "qemu/error-report.h"
 #include "trace.h"
+#include "system/qtest.h"
 
 #define CDL_STORE_HEADER_BYTES 96
 #define CDL_STORE_ENTRY_BYTES  32
-#define CDL_STORE_VERSION      2
-#define CDL_TXN_VERSION        3
-#define CDL_TXN_BYTES          96
-#define CDL_BATCH_HEADER_BYTES 64
-#define CDL_BATCH_VERSION      4
-
+#define CDL_STORE_VERSION      3
 static bool cdl_bytes_zero(const uint8_t *buf, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
@@ -21,15 +17,6 @@ static bool cdl_bytes_zero(const uint8_t *buf, size_t len)
         }
     }
     return true;
-}
-
-static uint64_t cdl_sat_inc(uint64_t value, bool *saturated)
-{
-    if (value >= UINT64_MAX - 1) {
-        *saturated = true;
-        return UINT64_MAX;
-    }
-    return value + 1;
 }
 
 static void cdl_digest(const uint8_t *buf, size_t prefix, size_t suffix_off,
@@ -49,6 +36,10 @@ static void cdl_digest(const uint8_t *buf, size_t prefix, size_t suffix_off,
 int64_t cdl_clock_now_ns(FemuCtrl *n)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!qtest_enabled()) {
+        return now;
+    }
     int64_t offset = qatomic_read(&n->cdl_test_clock_offset_ns);
 
     if ((offset > 0 && now > INT64_MAX - offset) ||
@@ -65,7 +56,7 @@ void cdl_test_advance(FemuCtrl *n, NvmeCdlTestDelay stage)
     uint64_t delay;
     int64_t offset;
 
-    if (stage >= CDL_TEST_DELAY_MAX) {
+    if (!qtest_enabled() || stage >= CDL_TEST_DELAY_MAX) {
         return;
     }
     delay = qatomic_xchg(&n->cdl_test_delay_ns[stage], 0);
@@ -85,6 +76,9 @@ bool cdl_test_take_execution_status(FemuCtrl *n, uint16_t *status)
 {
     bool valid;
 
+    if (!qtest_enabled()) {
+        return false;
+    }
     pthread_spin_lock(&n->cdl_lock);
     valid = n->cdl_test_execution_status_valid;
     if (valid) {
@@ -150,6 +144,9 @@ static int cdl_barrier_name(const char *name)
 /* No controller, scheduler, store or completion lock may be held here. */
 bool cdl_test_barrier_wait(FemuCtrl *n, NvmeCdlTestBarrier stage)
 {
+    if (!qtest_enabled()) {
+        return true;
+    }
     if (qatomic_read(&n->cdl_test_cut_stage) == stage) {
         fflush(NULL);
         _exit(86);
@@ -308,13 +305,13 @@ void cdl_test_command(FemuCtrl *n, const char *value, Error **errp)
         fields = g_strsplit(strchr(value, '=') + 1, ",", 3);
         if (g_strv_length(fields) != 3 ||
             !cdl_parse_u64(fields[0], &parsed[0]) ||
-            (parsed[0] != CDL_LOG_PAGE_C0 && parsed[0] != CDL_LOG_PAGE_C1) ||
+            parsed[0] != CDL_LOG_PAGE_C0 ||
             !cdl_parse_u64(fields[1], &parsed[1]) || parsed[1] >= CDL_LOG_HEADER_BYTES ||
             !cdl_parse_u64(fields[2], &parsed[2]) || parsed[2] > 255) {
             error_setg(errp, "invalid log response fixture");
             return;
         }
-        unsigned index = parsed[0] == CDL_LOG_PAGE_C1;
+        unsigned index = 0;
         n->cdl_test_log_xor_offset[index] = parsed[1];
         n->cdl_test_log_xor_value[index] = parsed[2];
         return;
@@ -442,38 +439,6 @@ void cdl_test_command(FemuCtrl *n, const char *value, Error **errp)
         }
         qatomic_set(&n->cdl_test_crash, crash);
         qatomic_set(&n->cdl_test_fault, point);
-        return;
-    }
-    if (g_str_has_prefix(value, "seed=")) {
-        g_autoptr(Error) local_err = NULL;
-
-        fields = g_strsplit(value + strlen("seed="), ",", 5);
-        if (g_strv_length(fields) != 5) {
-            error_setg(errp, "x-cdl-test seed needs class,timed,misses,generation,snapshot");
-            return;
-        }
-        for (int i = 0; i < 5; i++) {
-            if (!cdl_parse_u64(fields[i], &parsed[i])) {
-                error_setg(errp, "invalid x-cdl-test seed value");
-                return;
-            }
-        }
-        if (!parsed[0] || parsed[0] >= n->cdl_num_classes ||
-            parsed[2] > parsed[1]) {
-            error_setg(errp, "invalid x-cdl-test seed class or counters");
-            return;
-        }
-        pthread_spin_lock(&n->cdl_lock);
-        n->cdl_stats[parsed[0]].timed = parsed[1];
-        n->cdl_stats[parsed[0]].misses = parsed[2];
-        n->cdl_stats[parsed[0]].timed_saturated = parsed[1] == UINT64_MAX;
-        n->cdl_stats[parsed[0]].misses_saturated = parsed[2] == UINT64_MAX;
-        n->cdl_generation = parsed[3];
-        n->cdl_snapshot_seq = parsed[4];
-        pthread_spin_unlock(&n->cdl_lock);
-        if (!cdl_save_state(n, &local_err)) {
-            error_propagate(errp, g_steal_pointer(&local_err));
-        }
         return;
     }
     error_setg(errp, "unknown x-cdl-test command '%s'", value);
@@ -659,24 +624,19 @@ static uint8_t *cdl_encode_store(FemuCtrl *n, size_t *len_out)
     stl_le_p(buf + 8, CDL_STORE_VERSION);
     stl_le_p(buf + 12, n->cdl_num_classes);
     stq_le_p(buf + 16, n->cdl_generation);
-    stq_le_p(buf + 24, n->cdl_last_txid);
     memcpy(buf + 32, n->cdl_store_id, sizeof(n->cdl_store_id));
     stl_le_p(buf + 48, flags);
     stl_le_p(buf + 52, len - CDL_STORE_HEADER_BYTES);
 
     for (uint32_t c = 0; c < n->cdl_num_classes; c++) {
         NvmeCdlDescriptor *desc = &n->cdl_saved_desc[c];
-        NvmeCdlClassStats *stats = &n->cdl_stats[c];
         uint8_t *entry = buf + CDL_STORE_HEADER_BYTES +
                          (size_t)c * CDL_STORE_ENTRY_BYTES;
 
         entry[0] = n->cdl_saved_desc_present[c];
         entry[1] = desc->policy;
         stl_le_p(entry + 4, desc->duration_us);
-        entry[8] = (stats->timed_saturated ? 1u : 0u) |
-                   (stats->misses_saturated ? 2u : 0u);
-        stq_le_p(entry + 16, stats->timed);
-        stq_le_p(entry + 24, stats->misses);
+
     }
     cdl_digest(buf, 64, CDL_STORE_HEADER_BYTES, len, buf + 64);
     *len_out = len;
@@ -772,7 +732,10 @@ static bool cdl_decode_store(FemuCtrl *n, const uint8_t *buf, size_t len,
         return false;
     }
     n->cdl_generation = ldq_le_p(buf + 16);
-    n->cdl_last_txid = ldq_le_p(buf + 24);
+    if (!cdl_bytes_zero(buf + 24, 8)) {
+        error_setg(errp, "reserved CDL configuration header data");
+        return false;
+    }
     flags = ldl_le_p(buf + 48);
     if ((flags & ~3u) || (flags & 2u && !(flags & 1u)) ||
         !cdl_bytes_zero(buf + 56, 8)) {
@@ -785,11 +748,10 @@ static bool cdl_decode_store(FemuCtrl *n, const uint8_t *buf, size_t len,
     for (uint32_t c = 0; c < n->cdl_num_classes; c++) {
         const uint8_t *entry = buf + CDL_STORE_HEADER_BYTES +
                                (size_t)c * CDL_STORE_ENTRY_BYTES;
-        uint8_t stats_flags = entry[8];
 
-        if ((entry[0] & ~1u) || stats_flags & ~3u ||
+        if ((entry[0] & ~1u) ||
             !cdl_bytes_zero(entry + 2, 2) ||
-            !cdl_bytes_zero(entry + 9, 7) ||
+            !cdl_bytes_zero(entry + 8, 24) ||
             (!entry[0] && (entry[1] || ldl_le_p(entry + 4)))) {
             error_setg(errp, "CDL store '%s' has reserved entry data", n->cdl_file);
             return false;
@@ -798,8 +760,7 @@ static bool cdl_decode_store(FemuCtrl *n, const uint8_t *buf, size_t len,
         n->cdl_saved_desc[c].policy = entry[1];
         n->cdl_saved_desc[c].duration_us = ldl_le_p(entry + 4);
         if (c == 0 && (entry[0] || entry[1] || ldl_le_p(entry + 4) ||
-                       stats_flags || ldq_le_p(entry + 16) ||
-                       ldq_le_p(entry + 24))) {
+                       !cdl_bytes_zero(entry + 8, 24))) {
             error_setg(errp, "CDL store '%s' has nonzero bypass state", n->cdl_file);
             return false;
         }
@@ -808,147 +769,9 @@ static bool cdl_decode_store(FemuCtrl *n, const uint8_t *buf, size_t len,
             error_setg(errp, "CDL store '%s' has an invalid descriptor", n->cdl_file);
             return false;
         }
-        n->cdl_stats[c].timed_saturated = stats_flags & 1u;
-        n->cdl_stats[c].misses_saturated = stats_flags & 2u;
-        n->cdl_stats[c].timed = ldq_le_p(entry + 16);
-        n->cdl_stats[c].misses = ldq_le_p(entry + 24);
-        if ((n->cdl_stats[c].timed_saturated &&
-             n->cdl_stats[c].timed != UINT64_MAX) ||
-            (n->cdl_stats[c].misses_saturated &&
-             n->cdl_stats[c].misses != UINT64_MAX) ||
-            (n->cdl_stats[c].timed == UINT64_MAX &&
-             !n->cdl_stats[c].timed_saturated) ||
-            (n->cdl_stats[c].misses == UINT64_MAX &&
-             !n->cdl_stats[c].misses_saturated) ||
-            n->cdl_stats[c].misses > n->cdl_stats[c].timed) {
-            error_setg(errp, "CDL store '%s' has inconsistent saturation", n->cdl_file);
-            return false;
-        }
+
     }
     return true;
-}
-
-static char *cdl_txn_path(FemuCtrl *n)
-{
-    return g_strconcat(n->cdl_file, ".txn", NULL);
-}
-
-static void cdl_encode_txn(FemuCtrl *n, uint64_t txid, NvmeRequest *req,
-                           uint8_t *buf)
-{
-    memcpy(buf, "CDL2TXN\0", 8);
-    stl_le_p(buf + 8, CDL_TXN_VERSION);
-    buf[12] = req->wfq_cdl_class;
-    buf[13] = req->cdl_miss;
-    stq_le_p(buf + 16, txid);
-    memcpy(buf + 24, n->cdl_store_id, sizeof(n->cdl_store_id));
-    stq_le_p(buf + 40, req->cdl_attempt);
-    stq_le_p(buf + 48, req->cdl_duration_ns);
-    stq_le_p(buf + 56, req->cdl_elapsed_ns);
-    cdl_digest(buf, 64, CDL_TXN_BYTES, CDL_TXN_BYTES, buf + 64);
-}
-
-static bool cdl_write_txns(FemuCtrl *n, uint64_t first,
-                            NvmeRequest **reqs, unsigned count, Error **errp)
-{
-    g_autofree char *path = cdl_txn_path(n);
-    size_t header = count > 1 ? CDL_BATCH_HEADER_BYTES : 0;
-    size_t len = header + count * CDL_TXN_BYTES;
-    g_autofree uint8_t *buf = g_malloc0(len);
-
-    for (unsigned i = 0; i < count; i++) {
-        cdl_encode_txn(n, first + i, reqs[i], buf + header + i * CDL_TXN_BYTES);
-    }
-    if (header) {
-        memcpy(buf, "CDL2BTX\0", 8);
-        stl_le_p(buf + 8, CDL_BATCH_VERSION);
-        stl_le_p(buf + 12, count);
-        stq_le_p(buf + 16, first);
-        cdl_digest(buf, 32, header, len, buf + 32);
-    }
-    return cdl_atomic_write(n, path, buf, len, true, errp);
-}
-
-/* Caller holds cdl_store_lock. */
-static bool cdl_replay_txn_locked(FemuCtrl *n, Error **errp)
-{
-    g_autofree char *path = cdl_txn_path(n);
-    g_autofree uint8_t *buf = NULL;
-    uint8_t digest[32];
-    size_t len = 0;
-    bool missing;
-    uint64_t last = n->cdl_last_txid;
-    unsigned count = 1;
-    size_t header = 0;
-    bool changed = false;
-
-    if (!cdl_read_whole(path, &buf, &len, &missing, errp) || missing) {
-        return missing;
-    }
-    if (len >= CDL_BATCH_HEADER_BYTES && !memcmp(buf, "CDL2BTX\0", 8)) {
-        header = CDL_BATCH_HEADER_BYTES;
-        count = ldl_le_p(buf + 12);
-        cdl_digest(buf, 32, header, len, digest);
-        if (ldl_le_p(buf + 8) != CDL_BATCH_VERSION || count < 2 ||
-            count > CDL_ACCOUNT_BATCH || len != header + count * CDL_TXN_BYTES ||
-            !cdl_bytes_zero(buf + 24, 8) || memcmp(digest, buf + 32, 32)) {
-            error_setg(errp, "corrupt CDL batch transaction '%s'", path);
-            return false;
-        }
-    } else if (len != CDL_TXN_BYTES) {
-        error_setg(errp, "corrupt CDL transaction '%s'", path);
-        return false;
-    }
-    /* Validate the entire image before changing a single recovered counter. */
-    for (unsigned i = 0; i < count; i++) {
-        uint8_t *record = buf + header + i * CDL_TXN_BYTES;
-        uint64_t txid = ldq_le_p(record + 16);
-
-        cdl_digest(record, 64, CDL_TXN_BYTES, CDL_TXN_BYTES, digest);
-        if (memcmp(record, "CDL2TXN\0", 8) ||
-            ldl_le_p(record + 8) != CDL_TXN_VERSION ||
-            memcmp(digest, record + 64, 32) || record[13] > 1 ||
-            !cdl_bytes_zero(record + 14, 2) ||
-            memcmp(record + 24, n->cdl_store_id, sizeof(n->cdl_store_id)) ||
-            !ldq_le_p(record + 40) || !ldq_le_p(record + 48) ||
-            ldq_le_p(record + 56) > INT64_MAX ||
-            record[13] != (ldq_le_p(record + 56) > ldq_le_p(record + 48))) {
-            error_setg(errp, "corrupt CDL transaction '%s'", path);
-            return false;
-        }
-        if (!record[12] || record[12] >= n->cdl_num_classes || !txid ||
-            (txid > last && (last == UINT64_MAX || txid != last + 1)) ||
-            (i && (ldq_le_p(record - CDL_TXN_BYTES + 16) == UINT64_MAX ||
-                   txid != ldq_le_p(record - CDL_TXN_BYTES + 16) + 1)) ||
-            (header && !i && txid != ldq_le_p(buf + 16))) {
-            error_setg(errp, "invalid CDL transaction '%s'", path);
-            return false;
-        }
-        last = MAX(last, txid);
-    }
-    for (unsigned i = 0; i < count; i++) {
-        uint8_t *record = buf + header + i * CDL_TXN_BYTES;
-        uint64_t txid = ldq_le_p(record + 16);
-
-        if (txid > n->cdl_last_txid) {
-            NvmeCdlClassStats *stats = &n->cdl_stats[record[12]];
-
-            stats->timed = cdl_sat_inc(stats->timed, &stats->timed_saturated);
-            if (record[13]) {
-                stats->misses = cdl_sat_inc(stats->misses, &stats->misses_saturated);
-            }
-            n->cdl_last_txid = txid;
-            changed = true;
-        }
-    }
-    if (changed && !cdl_store_save_locked(n, errp)) {
-        return false;
-    }
-    if (unlink(path) < 0 && errno != ENOENT) {
-        error_setg_errno(errp, errno, "cannot remove CDL transaction '%s'", path);
-        return false;
-    }
-    return cdl_sync_parent(n, path, CDL_TEST_FAULT_NONE, errp);
 }
 
 bool cdl_init(FemuCtrl *n, Error **errp)
@@ -1015,16 +838,17 @@ bool cdl_init(FemuCtrl *n, Error **errp)
     n->cdl_desc = g_new0(NvmeCdlDescriptor, n->cdl_num_classes);
     n->cdl_saved_desc = g_new0(NvmeCdlDescriptor, n->cdl_num_classes);
     n->cdl_saved_desc_present = g_new0(bool, n->cdl_num_classes);
-    n->cdl_stats = g_new0(NvmeCdlClassStats, n->cdl_num_classes);
     n->cdl_assoc = g_new0(uint32_t, n->cdl_num_classes);
     n->cdl_inflight_by_class = g_new0(uint32_t, n->cdl_num_classes);
     n->cdl_dispatch_wait = g_new0(uint16_t, n->cdl_num_classes);
     n->wfq_f_last = g_new0(uint64_t, n->cdl_num_classes);
     n->cdl_rr_next = g_new0(uint16_t, n->cdl_num_classes);
     n->cdl_rr_started = g_new0(bool, n->cdl_num_classes);
-    n->cdl_test_dispatches = g_new0(uint64_t, n->cdl_num_classes);
-    n->cdl_test_dispatch_log = g_new0(NvmeCdlTestDispatch,
-                                      CDL_TEST_DISPATCH_LOG_ENTRIES);
+    if (qtest_enabled()) {
+        n->cdl_test_dispatches = g_new0(uint64_t, n->cdl_num_classes);
+        n->cdl_test_dispatch_log = g_new0(NvmeCdlTestDispatch,
+                                          CDL_TEST_DISPATCH_LOG_ENTRIES);
+    }
     wfq_init(n);
 
     qemu_mutex_lock(&n->cdl_store_lock);
@@ -1032,29 +856,14 @@ bool cdl_init(FemuCtrl *n, Error **errp)
         goto store_fault;
     }
     if (missing) {
-        g_autofree char *txn_path = cdl_txn_path(n);
-        g_autofree uint8_t *txn = NULL;
-        size_t txn_len = 0;
-        bool txn_missing;
         QemuUUID id;
 
-        if (!cdl_read_whole(txn_path, &txn, &txn_len, &txn_missing,
-                            &local_err)) {
-            goto store_fault;
-        }
-        if (!txn_missing) {
-            error_setg(&local_err,
-                       "CDL store '%s' is missing while transaction '%s' exists",
-                       n->cdl_file, txn_path);
-            goto store_fault;
-        }
         qemu_uuid_generate(&id);
         memcpy(n->cdl_store_id, id.data, sizeof(n->cdl_store_id));
         if (!cdl_store_save_locked(n, &local_err)) {
             goto store_fault;
         }
-    } else if (!cdl_decode_store(n, buf, len, &local_err) ||
-               !cdl_replay_txn_locked(n, &local_err)) {
+    } else if (!cdl_decode_store(n, buf, len, &local_err)) {
         goto store_fault;
     }
 
@@ -1091,7 +900,6 @@ void cdl_exit(FemuCtrl *n)
     g_clear_pointer(&n->cdl_desc, g_free);
     g_clear_pointer(&n->cdl_saved_desc, g_free);
     g_clear_pointer(&n->cdl_saved_desc_present, g_free);
-    g_clear_pointer(&n->cdl_stats, g_free);
     g_clear_pointer(&n->cdl_assoc, g_free);
     g_clear_pointer(&n->cdl_inflight_by_class, g_free);
     g_clear_pointer(&n->cdl_dispatch_wait, g_free);
@@ -1297,16 +1105,18 @@ static void cdl_dispatch_locked(FemuCtrl *n)
             cdl_next_member(n, best_class, sq->sqid);
         n->wfq_inflight++;
         n->cdl_inflight_by_class[best_class]++;
-        n->cdl_test_dispatches[best_class]++;
-        n->cdl_test_dispatch_total++;
-        if (n->cdl_test_dispatch_log_count <
-            CDL_TEST_DISPATCH_LOG_ENTRIES) {
-            NvmeCdlTestDispatch *entry = &n->cdl_test_dispatch_log[
-                n->cdl_test_dispatch_log_count++];
+        if (qtest_enabled()) {
+            n->cdl_test_dispatches[best_class]++;
+            n->cdl_test_dispatch_total++;
+            if (n->cdl_test_dispatch_log_count <
+                CDL_TEST_DISPATCH_LOG_ENTRIES) {
+                NvmeCdlTestDispatch *entry = &n->cdl_test_dispatch_log[
+                    n->cdl_test_dispatch_log_count++];
 
-            entry->sqid = sq->sqid;
-            entry->cid = le16_to_cpu(best_req->cmd.cid);
-            entry->cls = best_class;
+                entry->sqid = sq->sqid;
+                entry->cid = le16_to_cpu(best_req->cmd.cid);
+                entry->cls = best_class;
+            }
         }
         QTAILQ_INSERT_TAIL(&n->wfq_inflight_list, best_req,
                            wfq_inflight_entry);
@@ -1491,7 +1301,6 @@ void wfq_defer(FemuCtrl *n, NvmeRequest *req, int poller)
     req->wfq_poller_idx = poller;
     req->cdl_timed = true;
     req->cdl_checked = false;
-    req->cdl_accounted = false;
     req->cdl_cq_delay_applied = false;
     req->wfq_orphaned = false;
     QTAILQ_INSERT_TAIL(&req->sq->cdl_pending, req, wfq_entry);
@@ -1531,19 +1340,21 @@ bool cdl_check(FemuCtrl *n, NvmeRequest *req)
     if (req->cdl_timed && n->cdl_store_failed) {
         return false;
     }
-    if (!req->cdl_timed || req->cdl_accounted) {
+    if (!req->cdl_timed) {
         return true;
     }
     if (req->cdl_checked) {
         return true;
     }
-    pthread_spin_lock(&n->cdl_lock);
-    if (n->cdl_test_stop_delta_valid) {
-        stop_delta = n->cdl_test_stop_delta_ns;
-        n->cdl_test_stop_delta_valid = false;
-        stop_override = true;
+    if (qtest_enabled()) {
+        pthread_spin_lock(&n->cdl_lock);
+        if (n->cdl_test_stop_delta_valid) {
+            stop_delta = n->cdl_test_stop_delta_ns;
+            n->cdl_test_stop_delta_valid = false;
+            stop_override = true;
+        }
+        pthread_spin_unlock(&n->cdl_lock);
     }
-    pthread_spin_unlock(&n->cdl_lock);
     if (stop_override) {
         __int128 candidate = (__int128)req->cdl_start_ns + stop_delta;
 
@@ -1582,132 +1393,22 @@ bool cdl_check(FemuCtrl *n, NvmeRequest *req)
         return false;
     }
     miss = (uint64_t)elapsed > req->cdl_duration_ns;
-    req->cdl_stop_ns = stop;
-    req->cdl_elapsed_ns = elapsed;
-    req->cdl_miss = miss;
     req->cdl_checked = true;
     trace_femu_cdl_completion_check(n->cdl_trace_id, req->cdl_attempt,
                                     req->sq->sqid,
                                     le16_to_cpu(req->cmd.cid), cls,
                                     req->cdl_start_ns, stop, elapsed,
                                     req->cdl_duration_ns, miss);
-    /* The result is frozen before accounting, including on retries. */
+    /* Freeze once and release service ownership before CQ delivery. */
     cdl_release_slot(n, req, cls);
-    /* Pause/delete must still finish an accounting transaction already begun. */
     cdl_test_barrier_wait(n, CDL_BARRIER_CHECK);
-    cdl_test_advance(n, CDL_TEST_DELAY_DURABLE);
 
     return true;
 }
 
-bool cdl_account_many(FemuCtrl *n, NvmeRequest **reqs, unsigned count)
-{
-    g_autofree char *txn_path = NULL;
-    Error *err = NULL;
-    uint64_t first, timed[CDL_ACCOUNT_BATCH], misses[CDL_ACCOUNT_BATCH];
-    int64_t persist_start;
-
-    assert(count && count <= CDL_ACCOUNT_BATCH);
-    for (unsigned i = 0; i < count; i++) {
-        if (!cdl_check(n, reqs[i])) {
-            return false;
-        }
-        assert(reqs[i]->cdl_timed && !reqs[i]->cdl_accounted);
-    }
-    persist_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    qemu_mutex_lock(&n->cdl_store_lock);
-    /* Another service worker may have failed while this one waited. */
-    if (qatomic_read(&n->cdl_store_failed)) {
-        qemu_mutex_unlock(&n->cdl_store_lock);
-        return false;
-    }
-    pthread_spin_lock(&n->cdl_lock);
-    if (n->cdl_last_txid > UINT64_MAX - count) {
-        pthread_spin_unlock(&n->cdl_lock);
-        error_setg(&err, "CDL transaction identity exhausted");
-        goto fail;
-    }
-    first = n->cdl_last_txid + 1;
-    pthread_spin_unlock(&n->cdl_lock);
-    if (!cdl_write_txns(n, first, reqs, count, &err)) {
-        goto fail;
-    }
-    if (cdl_test_inject(n, CDL_TEST_FAULT_AFTER_INTENT, &err)) {
-        goto fail;
-    }
-
-    pthread_spin_lock(&n->cdl_lock);
-    for (unsigned i = 0; i < count; i++) {
-        NvmeRequest *req = reqs[i];
-        NvmeCdlClassStats *stats = &n->cdl_stats[req->wfq_cdl_class];
-
-        stats->timed = cdl_sat_inc(stats->timed, &stats->timed_saturated);
-        if (req->cdl_miss) {
-            stats->misses = cdl_sat_inc(stats->misses, &stats->misses_saturated);
-        }
-        req->cdl_accounted = true;
-        timed[i] = stats->timed;
-        misses[i] = stats->misses;
-    }
-    n->cdl_last_txid = first + (count - 1);
-    pthread_spin_unlock(&n->cdl_lock);
-    if (!cdl_store_save_locked(n, &err)) {
-        goto fail;
-    }
-    if (cdl_test_inject(n, CDL_TEST_FAULT_AFTER_STORE, &err)) {
-        goto fail;
-    }
-    for (unsigned i = 0; i < count; i++) {
-        NvmeRequest *req = reqs[i];
-
-        trace_femu_cdl_durable_commit(n->cdl_trace_id, req->cdl_attempt,
-            req->sq->sqid, le16_to_cpu(req->cmd.cid), req->wfq_cdl_class,
-            first + i, timed[i], misses[i]);
-    }
-    txn_path = cdl_txn_path(n);
-    if (cdl_test_inject(n, CDL_TEST_FAULT_BEFORE_UNLINK, &err)) {
-        goto fail;
-    }
-    if (unlink(txn_path) < 0 && errno != ENOENT) {
-        error_setg_errno(&err, errno, "cannot remove CDL transaction '%s'",
-                         txn_path);
-        goto fail;
-    }
-    if (cdl_test_inject(n, CDL_TEST_FAULT_AFTER_UNLINK, &err) ||
-        !cdl_sync_parent(n, txn_path, CDL_TEST_FAULT_NONE, &err)) {
-        goto fail;
-    }
-    qemu_mutex_unlock(&n->cdl_store_lock);
-    for (unsigned i = 0; i < count; i++) {
-        trace_femu_cdl_persist_latency(n->cdl_trace_id, reqs[i]->cdl_attempt,
-            first + i, count, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - persist_start);
-    }
-    return cdl_test_barrier_wait(n, CDL_BARRIER_DURABLE);
-
-fail:
-    qatomic_set(&n->cdl_store_failed, true);
-    n->bar.csts |= NVME_CSTS_FAILED;
-    qemu_mutex_unlock(&n->cdl_store_lock);
-    if (err) {
-        error_report_err(err);
-    }
-    return false;
-}
-
-bool cdl_account(FemuCtrl *n, NvmeRequest *req)
-{
-    if (!cdl_check(n, req)) {
-        return false;
-    }
-    if (!req->cdl_timed || req->cdl_accounted) {
-        return true;
-    }
-    return cdl_account_many(n, &req, 1);
-}
-
 bool wfq_on_complete(FemuCtrl *n, NvmeRequest *req)
 {
-    return cdl_account(n, req);
+    return cdl_check(n, req);
 }
 
 void wfq_init(FemuCtrl *n)
