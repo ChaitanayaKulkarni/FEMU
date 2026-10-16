@@ -20889,7 +20889,12 @@ static void femu_test_cdl_sq_count_invariance(void *obj, void *data,
 typedef struct FemuCdlFaultCase {
     char *id;
     char *point;
+    char *path;
+    bool batch;
 } FemuCdlFaultCase;
+
+static void femu_cdl_wait_barrier(QTestState *qts, const char *id,
+                                  unsigned wanted);
 
 /* T15: every durable write failure is visible and suppresses the timed CQE. */
 static void femu_test_cdl_store_fault(void *obj, void *data,
@@ -20915,13 +20920,30 @@ static void femu_test_cdl_store_fault(void *obj, void *data,
                                              &result)), ==, NVME_SUCCESS);
     femu_cdl_create_queue(&c, &c.io, 1, 1);
     femu_cdl_create_queue(&c, &ordinary, 2, 0);
-    femu_cdl_test_control(qts, test->id, command);
-
     rw.opcode = NVME_CMD_READ;
     rw.nsid = cpu_to_le32(1);
     rw.dptr.prp1 = cpu_to_le64(buf);
     rw.nlb = cpu_to_le16(FEMU_DATA_SIZE / c.lba_size - 1);
-    femu_submit(&c, &c.io, (NvmeCmd *)&rw);
+    if (test->batch) {
+        /* Hold the first backend owner until all twelve have been dispatched. */
+        femu_cdl_test_control(qts, test->id, "barrier=dispatch");
+        femu_cdl_submit_reads_bulk(&c, &c.io, buf, 12);
+        femu_cdl_wait_barrier(qts, test->id, 7);
+        for (unsigned poll = 0;; poll++) {
+            g_autofree char *state = femu_cdl_test_state(qts, test->id);
+
+            if (strstr(state, ";rings=1/11/0;")) {
+                break;
+            }
+            g_assert_cmpuint(poll, <, FEMU_POLL_LIMIT_MS);
+            g_usleep(1000);
+        }
+        femu_cdl_test_control(qts, test->id, command);
+        femu_cdl_test_control(qts, test->id, "barrier=none");
+    } else {
+        femu_cdl_test_control(qts, test->id, command);
+        femu_submit(&c, &c.io, (NvmeCmd *)&rw);
+    }
     do {
         csts = qpci_io_readl(c.pdev, c.bar, 0x1c);
         if (csts & NVME_CSTS_FAILED) {
@@ -20931,6 +20953,23 @@ static void femu_test_cdl_store_fault(void *obj, void *data,
         g_usleep(1000);
     } while (true);
     g_assert_false(femu_cq_ready(&c, &c.io));
+
+    if (test->batch) {
+        g_autofree char *path = g_strconcat(test->path, ".txn", NULL);
+        g_autofree char *image = NULL;
+        gsize size = 0;
+
+        /* Published intents must contain every member, even on checkpoint failure. */
+        if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+            g_assert_true(g_file_get_contents(path, &image, &size, NULL));
+            g_assert_cmpuint(size, ==, 64 + 12 * 96);
+            g_assert_cmpmem(image, 8, "CDL2BTX\0", 8);
+            g_assert_cmpuint(ldl_le_p(image + 12), ==, 12);
+        } else {
+            g_assert_true(g_str_has_prefix(test->point, "txn-") ||
+                          !strcmp(test->point, "after-unlink"));
+        }
+    }
 
     /* CFS suppresses subsequent ordinary service as well as the affected CQE. */
     qtest_memset(qts, buf, 0x7b, FEMU_DATA_SIZE);
@@ -22811,21 +22850,28 @@ static void femu_register_nodes(void)
             "after-store", "before-unlink", "after-unlink",
         };
 
+        /* Keep each discovery pass within libqos's fixed graph stack. */
+        bool batch = !g_strcmp0(g_getenv("FEMU_CDL_BATCH_FAULTS"), "1");
+
         for (size_t i = 0; i < ARRAY_SIZE(points); i++) {
             FemuCdlFaultCase *test = g_new0(FemuCdlFaultCase, 1);
-            char *name = g_strdup_printf("cdl-store-fault-%s", points[i]);
+            char *name = g_strdup_printf("cdl-%s-fault-%s",
+                                         batch ? "batch" : "store", points[i]);
             char *path = g_strdup_printf("%s/femu-cdl-fault-%zu-%d.state",
                                          g_get_tmp_dir(), i, (int)getpid());
 
             test->id = g_strdup_printf("cdl-fault-%zu", i);
             test->point = g_strdup(points[i]);
+            test->path = path;
+            test->batch = batch;
             femu_cdl_clean_store(path);
             qos_add_test(name, "femu", femu_test_cdl_store_fault,
                          &(QOSGraphTestOptions) {
                 .arg = test,
                 .edge.extra_device_opts = g_strdup_printf(
                     "id=%s,vid=0x8086,did=0x5845,cdl=on,"
-                    "cdl_classes=2,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=1,cdl_file=%s", test->id, path),
+                    "cdl_classes=2,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=1,"
+                    "femu_mode=%u,cdl_file=%s", test->id, batch ? 1 : 2, path),
             });
         }
     }

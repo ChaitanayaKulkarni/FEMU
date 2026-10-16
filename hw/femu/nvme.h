@@ -3049,6 +3049,8 @@ void cdl_exit(FemuCtrl *n);
 void cdl_reset(FemuCtrl *n);
 bool cdl_save_state(FemuCtrl *n, Error **errp);
 bool cdl_check(FemuCtrl *n, NvmeRequest *req);
+#define CDL_ACCOUNT_BATCH 64
+bool cdl_account_many(FemuCtrl *n, NvmeRequest **reqs, unsigned count);
 bool cdl_account(FemuCtrl *n, NvmeRequest *req);
 uint16_t nvme_cdl_execute(FemuCtrl *n, NvmeRequest *req);
 int64_t nvme_io_clock(FemuCtrl *n);

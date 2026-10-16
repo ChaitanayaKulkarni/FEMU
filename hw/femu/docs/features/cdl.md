@@ -54,3 +54,63 @@ by the complete CDL regression suite. The reference qtest records exact Identify
 and log images, verifies the 20-pair layout, then provisions all 52 pairs to test
 the advertised maximum. The local conformance contract defines T23–T26 in addition
 to T1–T22.
+
+## Timed NAND execution and durable accounting
+
+Use `femu_mode=1` (BBSSD) for full NAND execution and performance work. The
+Identify-only example above uses NoSSD as a small discovery fixture; it is not
+a performance configuration. The experiment launcher in `cdl-google-exp1/run.py`
+supplies the complete BBSSD geometry, kernel profile and fio workload.
+
+The controller FTL worker issues a bounded set of requests without sleeping
+through each modeled NAND latency. Executed timed requests remain owned by the
+FTL pending list until their modeled completion time. The worker freezes all
+ready timing results before starting durable accounting. Completion-ring
+backpressure retains those owners and cannot cause a second check or count.
+Delete and reset use the existing poller/FTL pause handshake to retire them.
+
+Already-ready results share one durable transaction, with at most 64 members.
+No command waits for a batch to fill. Every member receives its own contiguous
+transaction ID and counter update; all members are durable before any of their
+CQEs may be published. Persistence failure sets CFS and suppresses delivery.
+The `femu_cdl_persist_latency` trace reports native wall time and batch size;
+this measures host filesystem cost, separately from the controller timer.
+Its elapsed value covers the shared transaction and must not be summed once
+per member as if each member performed a separate store operation.
+
+The main checkpoint format and NVMe wire formats are unchanged. A single
+request still uses the existing 96-byte version-3 `CDL2TXN` intent. Multiple
+requests use a private version-4 `CDL2BTX` envelope in the same `.txn` path:
+
+| Offset | Bytes | Value |
+|---|---:|---|
+| 0 | 8 | `CDL2BTX` followed by NUL |
+| 8 | 4 | LE32 version 4 |
+| 12 | 4 | LE32 member count, 2 through 64 |
+| 16 | 8 | LE64 first transaction ID |
+| 24 | 8 | Reserved, zero |
+| 32 | 32 | SHA-256 of bytes 0–31 followed by bytes 64–end |
+| 64 | 96 × count | Individually checksummed version-3 member records |
+
+Recovery validates the complete envelope and every member, including store
+identity and contiguous nonwrapping transaction IDs, before changing counters.
+Only members newer than the checkpoint are applied. One new checkpoint covers
+the recovered suffix; replaying the same journal cannot recount its members.
+Malformed evidence is preserved and controller realization fails. An older
+FEMU binary cannot replay a pending version-4 envelope: use the new binary for
+recovery before attempting a downgrade, and retain backups of controller state.
+
+Run the existing fault tests normally and the BBSSD batch fault variants in a
+separate discovery pass (libqos has a fixed graph stack):
+
+```sh
+python3 hw/femu/tests/cdl-conformance.py --build build-perf --output <fresh-dir> \
+  --pty --batch-store-faults --match cdl-batch-fault-
+```
+
+The batch fixtures hold the first backend owner until twelve commands have
+been dispatched, inject each existing persistence failure, verify CFS and no
+CQEs, and inspect any published intent for all twelve members. Run
+`cdl-google-exp1/batch-recovery-test.py` separately for actual process-restart
+recovery of valid and malformed envelopes. These are controller checks; the
+fio same-CPU hint-swap audit supplies the separate kernel routing evidence.

@@ -1880,6 +1880,8 @@ static uint64_t femu_ftl_process_req(FemuCtrl *n, NvmeRequest *req)
 static void femu_ftl_complete_pending(FemuCtrl *n)
 {
     NvmeRequest *req, *next;
+    NvmeRequest *batch[CDL_ACCOUNT_BATCH];
+    unsigned count = 0;
 
     /* Freeze all ready results before any durable store operation can block. */
     QTAILQ_FOREACH(req, &n->ftl_pending, entry) {
@@ -1894,6 +1896,21 @@ static void femu_ftl_complete_pending(FemuCtrl *n)
             return;
         }
     }
+    QTAILQ_FOREACH(req, &n->ftl_pending, entry) {
+        if (!req->cdl_checked || req->cdl_accounted) {
+            continue;
+        }
+        batch[count++] = req;
+        if (count == ARRAY_SIZE(batch)) {
+            if (!cdl_account_many(n, batch, count)) {
+                return;
+            }
+            count = 0;
+        }
+    }
+    if (count && !cdl_account_many(n, batch, count)) {
+        return;
+    }
     QTAILQ_FOREACH_SAFE(req, &n->ftl_pending, entry, next) {
         int poller;
 
@@ -1904,9 +1921,7 @@ static void femu_ftl_complete_pending(FemuCtrl *n)
         if (!req->cdl_checked) {
             continue;
         }
-        if (!cdl_account(n, req)) {
-            return;
-        }
+        assert(req->cdl_accounted);
         poller = req->wfq_poller_idx;
         QTAILQ_REMOVE(&n->ftl_pending, req, entry);
         qatomic_dec(&n->ftl_pending_count);

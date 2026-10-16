@@ -325,6 +325,8 @@ def main() -> int:
     parser.add_argument("--regression", action="store_true",
                         help="run non-CDL FEMU nodes selected by --match")
     parser.add_argument("--pty", action="store_true")
+    parser.add_argument("--batch-store-faults", action="store_true",
+                        help="replace single-request fault fixtures with BBSSD batches")
     parser.add_argument("--timeout", type=float, default=600)
     args = parser.parse_args()
     if args.regression and not args.match:
@@ -340,6 +342,7 @@ def main() -> int:
     manifest = capture_source(repo, out, qemu, qos)
     manifest["diagnostic_subset"] = bool(args.match)
     manifest["regression"] = args.regression
+    manifest["batch_store_faults"] = args.batch_store_faults
     save_json(out / "manifest.json", manifest)
     client = repo.parent / "nvme-cdl-femu-qemu-kernel/tools/cdl-ctrl.c"
     probe = out / "cdl-profile-probe"
@@ -362,6 +365,7 @@ def main() -> int:
     env = os.environ | {"QTEST_QEMU_BINARY": str(qemu),
                         "QTEST_QEMU_IMG": str(build / "qemu-img"),
                         "FEMU_CDL_PROFILE_PROBE": str(probe)}
+    env["FEMU_CDL_BATCH_FAULTS"] = "1" if args.batch_store_faults else "0"
     if args.pty:
         env["QTEST_USE_PTY"] = "1"
     else:

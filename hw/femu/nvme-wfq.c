@@ -10,6 +10,8 @@
 #define CDL_STORE_VERSION      2
 #define CDL_TXN_VERSION        3
 #define CDL_TXN_BYTES          96
+#define CDL_BATCH_HEADER_BYTES 64
+#define CDL_BATCH_VERSION      4
 
 static bool cdl_bytes_zero(const uint8_t *buf, size_t len)
 {
@@ -831,12 +833,9 @@ static char *cdl_txn_path(FemuCtrl *n)
     return g_strconcat(n->cdl_file, ".txn", NULL);
 }
 
-static bool cdl_write_txn(FemuCtrl *n, uint64_t txid, NvmeRequest *req,
-                          Error **errp)
+static void cdl_encode_txn(FemuCtrl *n, uint64_t txid, NvmeRequest *req,
+                           uint8_t *buf)
 {
-    g_autofree char *path = cdl_txn_path(n);
-    uint8_t buf[CDL_TXN_BYTES] = { 0 };
-
     memcpy(buf, "CDL2TXN\0", 8);
     stl_le_p(buf + 8, CDL_TXN_VERSION);
     buf[12] = req->wfq_cdl_class;
@@ -846,8 +845,28 @@ static bool cdl_write_txn(FemuCtrl *n, uint64_t txid, NvmeRequest *req,
     stq_le_p(buf + 40, req->cdl_attempt);
     stq_le_p(buf + 48, req->cdl_duration_ns);
     stq_le_p(buf + 56, req->cdl_elapsed_ns);
-    cdl_digest(buf, 64, sizeof(buf), sizeof(buf), buf + 64);
-    return cdl_atomic_write(n, path, buf, sizeof(buf), true, errp);
+    cdl_digest(buf, 64, CDL_TXN_BYTES, CDL_TXN_BYTES, buf + 64);
+}
+
+static bool cdl_write_txns(FemuCtrl *n, uint64_t first,
+                            NvmeRequest **reqs, unsigned count, Error **errp)
+{
+    g_autofree char *path = cdl_txn_path(n);
+    size_t header = count > 1 ? CDL_BATCH_HEADER_BYTES : 0;
+    size_t len = header + count * CDL_TXN_BYTES;
+    g_autofree uint8_t *buf = g_malloc0(len);
+
+    for (unsigned i = 0; i < count; i++) {
+        cdl_encode_txn(n, first + i, reqs[i], buf + header + i * CDL_TXN_BYTES);
+    }
+    if (header) {
+        memcpy(buf, "CDL2BTX\0", 8);
+        stl_le_p(buf + 8, CDL_BATCH_VERSION);
+        stl_le_p(buf + 12, count);
+        stq_le_p(buf + 16, first);
+        cdl_digest(buf, 32, header, len, buf + 32);
+    }
+    return cdl_atomic_write(n, path, buf, len, true, errp);
 }
 
 /* Caller holds cdl_store_lock. */
@@ -858,49 +877,72 @@ static bool cdl_replay_txn_locked(FemuCtrl *n, Error **errp)
     uint8_t digest[32];
     size_t len = 0;
     bool missing;
-    uint64_t txid;
-    uint8_t cls;
-    bool miss;
+    uint64_t last = n->cdl_last_txid;
+    unsigned count = 1;
+    size_t header = 0;
+    bool changed = false;
 
     if (!cdl_read_whole(path, &buf, &len, &missing, errp) || missing) {
         return missing;
     }
-    if (len != CDL_TXN_BYTES) {
-        error_setg(errp, "corrupt CDL transaction '%s'", path);
-        return false;
-    }
-    cdl_digest(buf, 64, len, len, digest);
-    if (memcmp(buf, "CDL2TXN\0", 8) ||
-        ldl_le_p(buf + 8) != CDL_TXN_VERSION ||
-        memcmp(digest, buf + 64, sizeof(digest)) || buf[13] > 1 ||
-        !cdl_bytes_zero(buf + 14, 2) ||
-        memcmp(buf + 24, n->cdl_store_id, sizeof(n->cdl_store_id)) ||
-        !ldq_le_p(buf + 40) || !ldq_le_p(buf + 48) ||
-        ldq_le_p(buf + 56) > INT64_MAX ||
-        buf[13] != (ldq_le_p(buf + 56) > ldq_le_p(buf + 48))) {
-        error_setg(errp, "corrupt CDL transaction '%s'", path);
-        return false;
-    }
-    cls = buf[12];
-    miss = buf[13];
-    txid = ldq_le_p(buf + 16);
-    if (!cls || cls >= n->cdl_num_classes || txid == 0 ||
-        (txid > n->cdl_last_txid && txid != n->cdl_last_txid + 1)) {
-        error_setg(errp, "invalid CDL transaction '%s'", path);
-        return false;
-    }
-    if (txid > n->cdl_last_txid) {
-        NvmeCdlClassStats *stats = &n->cdl_stats[cls];
-
-        stats->timed = cdl_sat_inc(stats->timed, &stats->timed_saturated);
-        if (miss) {
-            stats->misses = cdl_sat_inc(stats->misses,
-                                        &stats->misses_saturated);
-        }
-        n->cdl_last_txid = txid;
-        if (!cdl_store_save_locked(n, errp)) {
+    if (len >= CDL_BATCH_HEADER_BYTES && !memcmp(buf, "CDL2BTX\0", 8)) {
+        header = CDL_BATCH_HEADER_BYTES;
+        count = ldl_le_p(buf + 12);
+        cdl_digest(buf, 32, header, len, digest);
+        if (ldl_le_p(buf + 8) != CDL_BATCH_VERSION || count < 2 ||
+            count > CDL_ACCOUNT_BATCH || len != header + count * CDL_TXN_BYTES ||
+            !cdl_bytes_zero(buf + 24, 8) || memcmp(digest, buf + 32, 32)) {
+            error_setg(errp, "corrupt CDL batch transaction '%s'", path);
             return false;
         }
+    } else if (len != CDL_TXN_BYTES) {
+        error_setg(errp, "corrupt CDL transaction '%s'", path);
+        return false;
+    }
+    /* Validate the entire image before changing a single recovered counter. */
+    for (unsigned i = 0; i < count; i++) {
+        uint8_t *record = buf + header + i * CDL_TXN_BYTES;
+        uint64_t txid = ldq_le_p(record + 16);
+
+        cdl_digest(record, 64, CDL_TXN_BYTES, CDL_TXN_BYTES, digest);
+        if (memcmp(record, "CDL2TXN\0", 8) ||
+            ldl_le_p(record + 8) != CDL_TXN_VERSION ||
+            memcmp(digest, record + 64, 32) || record[13] > 1 ||
+            !cdl_bytes_zero(record + 14, 2) ||
+            memcmp(record + 24, n->cdl_store_id, sizeof(n->cdl_store_id)) ||
+            !ldq_le_p(record + 40) || !ldq_le_p(record + 48) ||
+            ldq_le_p(record + 56) > INT64_MAX ||
+            record[13] != (ldq_le_p(record + 56) > ldq_le_p(record + 48))) {
+            error_setg(errp, "corrupt CDL transaction '%s'", path);
+            return false;
+        }
+        if (!record[12] || record[12] >= n->cdl_num_classes || !txid ||
+            (txid > last && (last == UINT64_MAX || txid != last + 1)) ||
+            (i && (ldq_le_p(record - CDL_TXN_BYTES + 16) == UINT64_MAX ||
+                   txid != ldq_le_p(record - CDL_TXN_BYTES + 16) + 1)) ||
+            (header && !i && txid != ldq_le_p(buf + 16))) {
+            error_setg(errp, "invalid CDL transaction '%s'", path);
+            return false;
+        }
+        last = MAX(last, txid);
+    }
+    for (unsigned i = 0; i < count; i++) {
+        uint8_t *record = buf + header + i * CDL_TXN_BYTES;
+        uint64_t txid = ldq_le_p(record + 16);
+
+        if (txid > n->cdl_last_txid) {
+            NvmeCdlClassStats *stats = &n->cdl_stats[record[12]];
+
+            stats->timed = cdl_sat_inc(stats->timed, &stats->timed_saturated);
+            if (record[13]) {
+                stats->misses = cdl_sat_inc(stats->misses, &stats->misses_saturated);
+            }
+            n->cdl_last_txid = txid;
+            changed = true;
+        }
+    }
+    if (changed && !cdl_store_save_locked(n, errp)) {
+        return false;
     }
     if (unlink(path) < 0 && errno != ENOENT) {
         error_setg_errno(errp, errno, "cannot remove CDL transaction '%s'", path);
@@ -1558,31 +1600,36 @@ bool cdl_check(FemuCtrl *n, NvmeRequest *req)
     return true;
 }
 
-bool cdl_account(FemuCtrl *n, NvmeRequest *req)
+bool cdl_account_many(FemuCtrl *n, NvmeRequest **reqs, unsigned count)
 {
     g_autofree char *txn_path = NULL;
     Error *err = NULL;
-    uint8_t cls = req->wfq_cdl_class;
-    uint64_t txid, timed, misses;
+    uint64_t first, timed[CDL_ACCOUNT_BATCH], misses[CDL_ACCOUNT_BATCH];
     int64_t persist_start;
 
-    if (!cdl_check(n, req)) {
-        return false;
-    }
-    if (!req->cdl_timed || req->cdl_accounted) {
-        return true;
+    assert(count && count <= CDL_ACCOUNT_BATCH);
+    for (unsigned i = 0; i < count; i++) {
+        if (!cdl_check(n, reqs[i])) {
+            return false;
+        }
+        assert(reqs[i]->cdl_timed && !reqs[i]->cdl_accounted);
     }
     persist_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     qemu_mutex_lock(&n->cdl_store_lock);
+    /* Another service worker may have failed while this one waited. */
+    if (qatomic_read(&n->cdl_store_failed)) {
+        qemu_mutex_unlock(&n->cdl_store_lock);
+        return false;
+    }
     pthread_spin_lock(&n->cdl_lock);
-    if (n->cdl_last_txid == UINT64_MAX) {
+    if (n->cdl_last_txid > UINT64_MAX - count) {
         pthread_spin_unlock(&n->cdl_lock);
         error_setg(&err, "CDL transaction identity exhausted");
         goto fail;
     }
-    txid = n->cdl_last_txid + 1;
+    first = n->cdl_last_txid + 1;
     pthread_spin_unlock(&n->cdl_lock);
-    if (!cdl_write_txn(n, txid, req, &err)) {
+    if (!cdl_write_txns(n, first, reqs, count, &err)) {
         goto fail;
     }
     if (cdl_test_inject(n, CDL_TEST_FAULT_AFTER_INTENT, &err)) {
@@ -1590,16 +1637,19 @@ bool cdl_account(FemuCtrl *n, NvmeRequest *req)
     }
 
     pthread_spin_lock(&n->cdl_lock);
-    NvmeCdlClassStats *stats = &n->cdl_stats[cls];
-    stats->timed = cdl_sat_inc(stats->timed, &stats->timed_saturated);
-    if (req->cdl_miss) {
-        stats->misses = cdl_sat_inc(stats->misses,
-                                    &stats->misses_saturated);
+    for (unsigned i = 0; i < count; i++) {
+        NvmeRequest *req = reqs[i];
+        NvmeCdlClassStats *stats = &n->cdl_stats[req->wfq_cdl_class];
+
+        stats->timed = cdl_sat_inc(stats->timed, &stats->timed_saturated);
+        if (req->cdl_miss) {
+            stats->misses = cdl_sat_inc(stats->misses, &stats->misses_saturated);
+        }
+        req->cdl_accounted = true;
+        timed[i] = stats->timed;
+        misses[i] = stats->misses;
     }
-    n->cdl_last_txid = txid;
-    req->cdl_accounted = true;
-    timed = stats->timed;
-    misses = stats->misses;
+    n->cdl_last_txid = first + (count - 1);
     pthread_spin_unlock(&n->cdl_lock);
     if (!cdl_store_save_locked(n, &err)) {
         goto fail;
@@ -1607,10 +1657,13 @@ bool cdl_account(FemuCtrl *n, NvmeRequest *req)
     if (cdl_test_inject(n, CDL_TEST_FAULT_AFTER_STORE, &err)) {
         goto fail;
     }
-    trace_femu_cdl_durable_commit(n->cdl_trace_id, req->cdl_attempt,
-                           req->sq->sqid,
-                                  le16_to_cpu(req->cmd.cid), cls, txid,
-                                  timed, misses);
+    for (unsigned i = 0; i < count; i++) {
+        NvmeRequest *req = reqs[i];
+
+        trace_femu_cdl_durable_commit(n->cdl_trace_id, req->cdl_attempt,
+            req->sq->sqid, le16_to_cpu(req->cmd.cid), req->wfq_cdl_class,
+            first + i, timed[i], misses[i]);
+    }
     txn_path = cdl_txn_path(n);
     if (cdl_test_inject(n, CDL_TEST_FAULT_BEFORE_UNLINK, &err)) {
         goto fail;
@@ -1625,18 +1678,31 @@ bool cdl_account(FemuCtrl *n, NvmeRequest *req)
         goto fail;
     }
     qemu_mutex_unlock(&n->cdl_store_lock);
-    trace_femu_cdl_persist_latency(n->cdl_trace_id, req->cdl_attempt, txid,
-        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - persist_start);
+    for (unsigned i = 0; i < count; i++) {
+        trace_femu_cdl_persist_latency(n->cdl_trace_id, reqs[i]->cdl_attempt,
+            first + i, count, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - persist_start);
+    }
     return cdl_test_barrier_wait(n, CDL_BARRIER_DURABLE);
 
 fail:
-    n->cdl_store_failed = true;
+    qatomic_set(&n->cdl_store_failed, true);
     n->bar.csts |= NVME_CSTS_FAILED;
     qemu_mutex_unlock(&n->cdl_store_lock);
     if (err) {
         error_report_err(err);
     }
     return false;
+}
+
+bool cdl_account(FemuCtrl *n, NvmeRequest *req)
+{
+    if (!cdl_check(n, req)) {
+        return false;
+    }
+    if (!req->cdl_timed || req->cdl_accounted) {
+        return true;
+    }
+    return cdl_account_many(n, &req, 1);
 }
 
 bool wfq_on_complete(FemuCtrl *n, NvmeRequest *req)
