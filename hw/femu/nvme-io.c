@@ -1,7 +1,8 @@
 #include "./nvme.h"
 #include "nvme-pi.h"
+#include "trace.h"
 
-static int64_t nvme_io_clock(FemuCtrl *n)
+int64_t nvme_io_clock(FemuCtrl *n)
 {
     return qemu_clock_get_ns(n->test_oc12_clock ? QEMU_CLOCK_VIRTUAL :
                                                 QEMU_CLOCK_REALTIME);
@@ -58,12 +59,35 @@ static bool nvme_try_post_cqe(FemuCtrl *n, NvmeCQueue *cq, NvmeRequest *req)
 {
     bool full;
 
+    if (qatomic_read(&n->cdl_store_failed)) {
+        return false;
+    }
+    if (n->cdl_profile && req->cdl_attempt &&
+        !cdl_test_barrier_wait(n, CDL_BARRIER_CQ)) {
+        return false;
+    }
+
+    if (req->cdl_admitted && !req->cdl_cq_delay_applied) {
+        cdl_test_advance(n, CDL_TEST_DELAY_CQ);
+        req->cdl_cq_delay_applied = true;
+    }
     nvme_cq_lock(n, cq);
     full = nvme_cq_full(cq);
     if (!full) {
         nvme_post_cqe(cq, req);
+        if (n->cdl_profile && req->cdl_attempt) {
+            trace_femu_cdl_cq_post(n->cdl_trace_id, req->cdl_attempt,
+                                   req->sq->sqid,
+                                   le16_to_cpu(req->cmd.cid),
+                                   req->wfq_cdl_class, cq->cqid,
+                                   req->status,
+                                   cdl_clock_now_ns(n));
+        }
     }
     nvme_cq_unlock(n, cq);
+    if (!full && req->cdl_admitted) {
+        cdl_test_barrier_wait(n, CDL_BARRIER_POST_CQ);
+    }
 
     return !full;
 }
@@ -76,6 +100,10 @@ static int nvme_post_backlog(FemuCtrl *n, int index_poller, bool *should_isr)
     int posted = 0;
 
     QTAILQ_FOREACH_SAFE(req, backlog, entry, next) {
+        if (!qatomic_read(&n->dataplane_started) ||
+            qatomic_read(&n->cdl_store_failed)) {
+            break;
+        }
         NvmeCQueue *cq = n->cq[req->sq->cqid];
 
         if (!nvme_try_post_cqe(n, cq, req)) {
@@ -88,6 +116,48 @@ static int nvme_post_backlog(FemuCtrl *n, int index_poller, bool *should_isr)
     }
 
     return posted;
+}
+
+static void nvme_trace_bypass_dispatch(FemuCtrl *n, NvmeRequest *req)
+{
+    if (n->cdl_profile && req->cdl_attempt && !req->cdl_admitted &&
+        req->status == NVME_SUCCESS) {
+        trace_femu_cdl_bypass_dispatch(n->cdl_trace_id, req->cdl_attempt,
+            req->sq->sqid, le16_to_cpu(req->cmd.cid), req->cmd_opcode);
+    }
+}
+
+static void nvme_retry_ftl_backlog(FemuCtrl *n, int poller)
+{
+    union cq_req_list *backlog = &n->ftl_backlog[poller];
+
+    while (!QTAILQ_EMPTY(backlog)) {
+        NvmeRequest *req = QTAILQ_FIRST(backlog);
+
+        if (femu_ring_enqueue(n->to_ftl[poller], (void *)&req, 1) != 1) {
+            break;
+        }
+        QTAILQ_REMOVE(backlog, req, entry);
+        nvme_trace_bypass_dispatch(n, req);
+        assert(qatomic_read(&n->ftl_backlog_count[poller]));
+        qatomic_set(&n->ftl_backlog_count[poller],
+                    qatomic_read(&n->ftl_backlog_count[poller]) - 1);
+    }
+}
+
+void nvme_enqueue_or_backlog(FemuCtrl *n, NvmeRequest *req, int poller)
+{
+    union cq_req_list *backlog = &n->ftl_backlog[poller];
+
+    nvme_retry_ftl_backlog(n, poller);
+    if (QTAILQ_EMPTY(backlog) &&
+        femu_ring_enqueue(n->to_ftl[poller], (void *)&req, 1) == 1) {
+        nvme_trace_bypass_dispatch(n, req);
+        return;
+    }
+    QTAILQ_INSERT_TAIL(backlog, req, entry);
+    qatomic_set(&n->ftl_backlog_count[poller],
+                qatomic_read(&n->ftl_backlog_count[poller]) + 1);
 }
 
 static void nvme_update_sq_eventidx(const NvmeSQueue *sq)
@@ -176,6 +246,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
     bool inline_mode = NOSSD(n) && n->hiops_inline;
     bool did_isr = false;
 
+    nvme_retry_ftl_backlog(n, index_poller);
     nvme_update_sq_tail(sq);
     /*
      * One request per ring slot, handed to the FTL and only returned on
@@ -184,6 +255,13 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
      * rather than taking a request that is not there.
      */
     while (!nvme_sq_empty(sq) && !QTAILQ_EMPTY(&sq->req_list)) {
+        if (qatomic_read(&n->cdl_store_failed)) {
+            break;
+        }
+        /* Bound upstream fetch independently of class duration or ENABLE. */
+        if (n->cdl_profile && processed >= 64) {
+            break;
+        }
         /*
          * Inline mode completes into the CQ within this same sweep, so unlike
          * the FTL path (which is latency-throttled and drip-feeds completions
@@ -242,6 +320,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->dsm_ranges = NULL;
         req->dsm_nr_ranges = 0;
         req->dsm_attributes = 0;
+        req->meta_buf = NULL;
         req->zone_resets = NULL;
         req->nr_zone_resets = 0;
         req->fdp_pids = NULL;
@@ -250,21 +329,58 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->fdp_dspec = 0;
         req->cxl_seq = 0;
         req->defer = NULL;
+        req->wfq_cdl_class = 0;
+        req->cdl_staged = false;
+        req->cdl_admitted = false;
+        req->cdl_executed = false;
+        req->cdl_timed = false;
+        req->cdl_checked = false;
+        req->cdl_miss = false;
+        req->cdl_accounted = false;
+        req->cdl_cq_delay_applied = false;
         /* Coperd: record req->stime at earliest convenience */
         req->expire_time = req->stime = nvme_io_clock(n);
         req->cqe.cid = cmd.cid;
         req->cmd_opcode = cmd.opcode;
         memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
+        req->write_data = NULL;
+        req->cdl_attempt = 0;
+        if (n->cdl_profile) {
+            req->cdl_attempt = qatomic_fetch_inc(&n->cdl_attempt_seq) + 1;
+            if (!req->cdl_attempt) {
+                n->cdl_store_failed = true;
+                n->bar.csts |= NVME_CSTS_FAILED;
+                QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
+                break;
+            }
+            trace_femu_cdl_fetch(n->cdl_trace_id, req->cdl_attempt,
+                                   sq->sqid, le16_to_cpu(cmd.cid),
+                                 sq->cdl_class, cmd.opcode,
+                                 cdl_clock_now_ns(n));
+            cdl_test_advance(n, CDL_TEST_DELAY_FETCH);
+            if (!cdl_test_barrier_wait(n, CDL_BARRIER_FETCH)) {
+                QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
+                break;
+            }
+        }
 
         if (n->print_log) {
             femu_debug("%s,cid:%d\n", __func__, cmd.cid);
         }
 
         req->write_data = NULL;
-        if (n->power_loss) {
+        if (n->cdl_profile && sq->cdl_class &&
+            (req->ns = nvme_ns(n, le32_to_cpu(cmd.nsid))) &&
+            req->ns->csi == NVME_CSI_NVM &&
+            (cmd.opcode == NVME_CMD_READ || cmd.opcode == NVME_CMD_WRITE ||
+             (cmd.opcode == NVME_CMD_DSM &&
+              (le32_to_cpu(cmd.cdw11) & NVME_DSMGMT_AD)))) {
+            req->cdl_staged = true;
+        }
+        if (n->power_loss && !req->cdl_staged) {
             req->ns = nvme_ns(n, le32_to_cpu(cmd.nsid));
         }
-        if (n->power_loss && req->ns) {
+        if (n->power_loss && req->ns && !req->cdl_staged) {
             status = NVME_SUCCESS;
         } else {
             if (nvme_ns_shared(n)) {
@@ -276,6 +392,13 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
             }
         }
         req->status = status;
+        if (n->cdl_profile) {
+            cdl_test_advance(n, CDL_TEST_DELAY_VALIDATION);
+            trace_femu_cdl_validation(n->cdl_trace_id, req->cdl_attempt,
+                                   sq->sqid, le16_to_cpu(cmd.cid),
+                                      sq->cdl_class, cmd.opcode, status,
+                                      cdl_clock_now_ns(n));
+        }
 
         /*
          * Host I/O totals for the SMART health log, counted here so every mode
@@ -337,10 +460,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
          * defer through the WFQ scheduler instead of going straight to FTL.
          * Only read/write commands carry duration limits; others bypass.
          */
-        if (status == NVME_SUCCESS && n->cdl_enabled && sq->cdl_class != 0 &&
-            (req->cmd_opcode == NVME_CMD_READ ||
-             req->cmd_opcode == NVME_CMD_WRITE)) {
-            req->wfq_cdl_class = sq->cdl_class; /* capture now; wfq_defer reads from req */
+        if (status == NVME_SUCCESS && req->cdl_staged) {
             req->defer = wfq_defer;
         }
 
@@ -348,7 +468,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
          * The host-link and controller-CPU models are applied on the ring
          * path, so a request that should pay them cannot complete inline.
          */
-        if (inline_mode && !n->pcie_enabled && !n->fw_cpu_ns &&
+        if (inline_mode && !req->defer && !n->pcie_enabled && !n->fw_cpu_ns &&
             req->ns && NS_NOSSD(req->ns)) {
             /*
              * Inline completion: NoSSD has zero latency, so the request is
@@ -361,6 +481,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
              */
             NvmeCQueue *cq = n->cq[sq->cqid];
 
+            nvme_trace_bypass_dispatch(n, req);
             nvme_req_release_ranges(req);
             /*
              * The check at the top of the loop is taken without the queue
@@ -387,13 +508,13 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
              * completed back to the guest, eventually causing the NVMe
              * driver to timeout and crash.
              */
-            int rc = femu_ring_enqueue(n->to_ftl[index_poller], (void *)&req, 1);
-            if (rc != 1) {
-                femu_err("enqueue failed, ret=%d\n", rc);
-            }
+            nvme_enqueue_or_backlog(n, req, index_poller);
         }
 
         processed++;
+        if (!qatomic_read(&n->dataplane_started)) {
+            break;
+        }
     }
 
     /*
@@ -412,6 +533,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
 
     nvme_update_sq_eventidx(sq);
     sq->completed += processed;
+    cdl_dispatch(n);
 }
 
 static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req)
@@ -432,6 +554,64 @@ static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req)
     nvme_inc_cq_tail(cq);
 }
 
+void nvme_apply_service_delay(FemuCtrl *n, NvmeRequest *req)
+{
+    /*
+     * Optional host-link model: charge the transfer over a link of the
+     * configured bandwidth plus a propagation delay. The link is one
+     * physical resource, so transfers queue behind each other through a
+     * next-available time, kept per direction since a read and a write
+     * travel opposite ways over it. Applied once the media latency is
+     * already in expire_time and before the completion is posted.
+     */
+    if (unlikely(n->pcie_enabled) && req->ns &&
+        (req->cmd_opcode == NVME_CMD_READ ||
+         req->cmd_opcode == NVME_CMD_WRITE)) {
+        uint8_t lbads = req->ns->id_ns.lbaf[
+            NVME_ID_NS_FLBAS_INDEX(req->ns->id_ns.flbas)].lbads;
+        /*
+         * A key-value store and retrieve share these opcodes and carry no
+         * block count, so the link was charged for whatever the previous
+         * command in this request slot moved, in its direction.
+         */
+        uint64_t data_size = NS_KVSSD(req->ns) ? req->xfer_bytes :
+                             (uint64_t)req->nlb << lbads;
+        uint64_t trans_ns = n->pcie_bandwidth_mbps ?
+            data_size * 1000 / n->pcie_bandwidth_mbps : 0;
+        uint64_t *next, start;
+
+        pthread_spin_lock(&n->pcie_lock);
+        next = req->is_write ? &n->pcie_rx_next_avail_time :
+                               &n->pcie_tx_next_avail_time;
+        start = (*next > (uint64_t)req->expire_time) ?
+                *next : (uint64_t)req->expire_time;
+        *next = start + trans_ns;
+        req->expire_time = (int64_t)(*next + n->pcie_prop_delay_ns);
+        pthread_spin_unlock(&n->pcie_lock);
+    }
+
+    /*
+     * Optional controller-CPU model: charge a fixed cost per command on a
+     * single firmware core. At high rates this caps throughput at roughly
+     * one command per fw_cpu_ns, the way a real controller's CPU does. It
+     * is a separate resource from the link, so it takes its own lock.
+     */
+    if (unlikely(n->fw_cpu_ns) &&
+        (req->cmd_opcode == NVME_CMD_READ ||
+         req->cmd_opcode == NVME_CMD_WRITE ||
+         req->cmd_opcode == NVME_CMD_ZONE_APPEND)) {
+        uint64_t start;
+
+        pthread_spin_lock(&n->fw_cpu_lock);
+        start = (n->fw_cpu_next_avail_time > (uint64_t)req->expire_time) ?
+                n->fw_cpu_next_avail_time : (uint64_t)req->expire_time;
+        n->fw_cpu_next_avail_time = start + n->fw_cpu_ns;
+        req->expire_time = (int64_t)n->fw_cpu_next_avail_time;
+        pthread_spin_unlock(&n->fw_cpu_lock);
+    }
+
+}
+
 static void nvme_process_cq_cpl(void *arg, int index_poller)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -445,11 +625,19 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
     int rc;
     int i;
 
+    if (qatomic_read(&n->cdl_store_failed) ||
+        qatomic_read(&n->cdl_test_hold_completion_poller) == index_poller) {
+        return;
+    }
     if (n->use_ftl_thread) {
         rp = n->to_poller[index_poller];
     }
 
     while (femu_ring_count(rp)) {
+        if (!qatomic_read(&n->dataplane_started) ||
+            qatomic_read(&n->cdl_store_failed)) {
+            break;
+        }
         req = NULL;
         rc = femu_ring_dequeue(rp, (void *)&req, 1);
         if (rc != 1) {
@@ -457,58 +645,21 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         }
         assert(req);
 
-        /*
-         * Optional host-link model: charge the transfer over a link of the
-         * configured bandwidth plus a propagation delay. The link is one
-         * physical resource, so transfers queue behind each other through a
-         * next-available time, kept per direction since a read and a write
-         * travel opposite ways over it. Applied once the media latency is
-         * already in expire_time and before the completion is posted.
-         */
-        if (unlikely(n->pcie_enabled) && req->ns &&
-            (req->cmd_opcode == NVME_CMD_READ ||
-             req->cmd_opcode == NVME_CMD_WRITE)) {
-            uint8_t lbads = req->ns->id_ns.lbaf[
-                NVME_ID_NS_FLBAS_INDEX(req->ns->id_ns.flbas)].lbads;
-            /*
-             * A key-value store and retrieve share these opcodes and carry no
-             * block count, so the link was charged for whatever the previous
-             * command in this request slot moved, in its direction.
-             */
-            uint64_t data_size = NS_KVSSD(req->ns) ? req->xfer_bytes :
-                                 (uint64_t)req->nlb << lbads;
-            uint64_t trans_ns = n->pcie_bandwidth_mbps ?
-                data_size * 1000 / n->pcie_bandwidth_mbps : 0;
-            uint64_t *next, start;
+        /* A successful dequeue frees a scheduler destination slot. */
+        nvme_retry_ftl_backlog(n, index_poller);
+        cdl_dispatch(n);
 
-            pthread_spin_lock(&n->pcie_lock);
-            next = req->is_write ? &n->pcie_rx_next_avail_time :
-                                   &n->pcie_tx_next_avail_time;
-            start = (*next > (uint64_t)req->expire_time) ?
-                    *next : (uint64_t)req->expire_time;
-            *next = start + trans_ns;
-            req->expire_time = (int64_t)(*next + n->pcie_prop_delay_ns);
-            pthread_spin_unlock(&n->pcie_lock);
+        /* NoSSD has no FTL worker, so dispatched CDL effects execute here. */
+        if (req->cdl_admitted && !req->cdl_executed &&
+            !cdl_test_barrier_wait(n, CDL_BARRIER_DISPATCH)) {
+            continue;
+        }
+        if (req->cdl_staged && !req->cdl_executed) {
+            req->status = nvme_cdl_execute(n, req);
         }
 
-        /*
-         * Optional controller-CPU model: charge a fixed cost per command on a
-         * single firmware core. At high rates this caps throughput at roughly
-         * one command per fw_cpu_ns, the way a real controller's CPU does. It
-         * is a separate resource from the link, so it takes its own lock.
-         */
-        if (unlikely(n->fw_cpu_ns) &&
-            (req->cmd_opcode == NVME_CMD_READ ||
-             req->cmd_opcode == NVME_CMD_WRITE ||
-             req->cmd_opcode == NVME_CMD_ZONE_APPEND)) {
-            uint64_t start;
-
-            pthread_spin_lock(&n->fw_cpu_lock);
-            start = (n->fw_cpu_next_avail_time > (uint64_t)req->expire_time) ?
-                    n->fw_cpu_next_avail_time : (uint64_t)req->expire_time;
-            n->fw_cpu_next_avail_time = start + n->fw_cpu_ns;
-            req->expire_time = (int64_t)n->fw_cpu_next_avail_time;
-            pthread_spin_unlock(&n->fw_cpu_lock);
+        if (!req->cdl_checked) {
+            nvme_apply_service_delay(n, req);
         }
 
         pqueue_insert(pq, req);
@@ -519,6 +670,10 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
     }
 
     while ((req = pqueue_peek(pq))) {
+        if (!qatomic_read(&n->dataplane_started) ||
+            qatomic_read(&n->cdl_store_failed)) {
+            break;
+        }
         now = nvme_io_clock(n);
         if (now < req->expire_time) {
             break;
@@ -537,9 +692,19 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
 
         pqueue_pop(pq);
 
+        if (req->cdl_admitted && !req->cdl_checked) {
+            cdl_test_advance(n, CDL_TEST_DELAY_BACKEND);
+            trace_femu_cdl_backend_complete(n->cdl_trace_id, req->cdl_attempt,
+                                   req->sq->sqid,
+                                            le16_to_cpu(req->cmd.cid),
+                                            req->wfq_cdl_class,
+                                            req->status,
+                                            cdl_clock_now_ns(n));
+        }
+
         /* TP4221: CDL miss detection and WFQ slot release */
-        if (req->wfq_cdl_class) {
-            wfq_on_complete(n, req);
+        if (req->wfq_cdl_class && !wfq_on_complete(n, req)) {
+            continue;
         }
 
         /*
@@ -725,6 +890,112 @@ static uint16_t nvme_rw_map_sgl(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     return status;
 }
 
+/* Validate a command data pointer without moving command data. */
+static uint16_t nvme_cdl_validate_dptr(FemuCtrl *n, NvmeCmd *cmd, uint64_t len)
+{
+    QEMUSGList qsg = { 0 };
+    QEMUIOVector iov = { 0 };
+    uint16_t status;
+
+    if (len > UINT32_MAX) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    status = femu_map_dptr(n, cmd, &qsg, &iov, len);
+    if (status) {
+        return status;
+    }
+    if (qsg.nsg) {
+        qemu_sglist_destroy(&qsg);
+    } else {
+        qemu_iovec_destroy(&iov);
+    }
+    return NVME_SUCCESS;
+}
+
+/*
+ * Stage a CDL Read or Write after semantic validation. A Write copies its host
+ * payload into controller-owned memory; a Read only validates its data pointer.
+ * Neither path changes media or guest-visible result data before admission.
+ */
+static uint16_t nvme_cdl_stage_rw(FemuCtrl *n, NvmeNamespace *ns,
+                                  NvmeCmd *cmd, NvmeRequest *req,
+                                  uint64_t slba, uint32_t nlb,
+                                  uint16_t control, uint64_t data_size,
+                                  uint64_t meta_size, bool extended)
+{
+    NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
+    uint16_t ms = nvme_ns_ms(ns);
+    uint64_t mptr = le64_to_cpu(rw->mptr);
+    uint64_t xfer = data_size + (extended ? meta_size : 0);
+    uint16_t status;
+
+    req->slba = slba;
+    req->nlb = nlb;
+    req->ctrl = control;
+    req->meta_size = meta_size;
+    req->mptr = mptr;
+
+    if (femu_pi_type(ns)) {
+        uint32_t ref = le32_to_cpu(rw->reftag);
+
+        if (!req->is_write || !(control & NVME_RW_PRINFO_PRACT)) {
+            status = femu_pi_check_ref(ns, control, slba, ref);
+            if (status) {
+                return status;
+            }
+        }
+        if (req->is_write) {
+            req->write_data = g_malloc(data_size);
+            req->meta_buf = g_malloc0(meta_size);
+            status = femu_pi_transfer(n, ns, cmd, req->write_data,
+                                      req->meta_buf, false);
+            if (status) {
+                return status;
+            }
+            if (control & NVME_RW_PRINFO_PRACT) {
+                femu_pi_generate(ns, req->write_data, req->meta_buf, nlb,
+                                 ref, le16_to_cpu(rw->apptag));
+            } else {
+                status = femu_pi_check(ns, req->write_data, req->meta_buf,
+                                       nlb, control, slba, ref,
+                                       le16_to_cpu(rw->apptag),
+                                       le16_to_cpu(rw->appmask));
+                if (status) {
+                    return status;
+                }
+            }
+            return NVME_SUCCESS;
+        }
+        if (ms && !extended &&
+            (cmd->psdt == NVME_PSDT_SGL_MPTR_SGL || (mptr & 3) ||
+             mptr > UINT64_MAX - meta_size)) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        return nvme_cdl_validate_dptr(n, cmd, xfer);
+    }
+
+    if (meta_size && !extended &&
+        (cmd->psdt == NVME_PSDT_SGL_MPTR_SGL || (mptr & 3) ||
+         mptr > UINT64_MAX - meta_size)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (req->is_write) {
+        req->write_data = g_malloc(xfer);
+        status = dma_write_cmd(n, cmd, req->write_data, xfer);
+        if (status) {
+            return status;
+        }
+        if (meta_size && !extended) {
+            req->meta_buf = g_malloc(meta_size);
+            if (femu_dma_read(n, mptr, req->meta_buf, meta_size)) {
+                return NVME_DATA_TRAS_ERROR | NVME_DNR;
+            }
+        }
+        return NVME_SUCCESS;
+    }
+    return nvme_cdl_validate_dptr(n, cmd, xfer);
+}
+
 /*
  * Extended LBAs (NVM 1.2, 2.1.4.1): each block's metadata follows its data in
  * the host buffer, so the transfer is nlb * (block + ms) bytes, split between
@@ -811,7 +1082,7 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     int ret;
 
     req->is_write = (rw->opcode == NVME_CMD_WRITE) ? 1 : 0;
-    if (req->is_write) {
+    if (req->is_write && !req->cdl_staged) {
         nvme_note_user_write(n);
     }
 
@@ -828,6 +1099,11 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
                                  meta_size);
     if (err)
         return err;
+
+    if (req->cdl_staged) {
+        return nvme_cdl_stage_rw(n, ns, cmd, req, slba, nlb, ctrl,
+                                 data_size, meta_size, extended);
+    }
 
     if (n->power_loss && req->is_write) {
         uint8_t *data = g_malloc(data_size);
@@ -1155,22 +1431,17 @@ static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         g_free(ranges);
         return NVME_SUCCESS;
     }
-    status = bbssd_drain_namespace(ns, req->stime, &req->reqlat);
-    if (status) {
-        g_free(ranges);
-        return status;
+    if (!req->cdl_staged) {
+        status = bbssd_drain_namespace(ns, req->stime, &req->reqlat);
+        if (status) {
+            g_free(ranges);
+            return status;
+        }
+        for (i = 0; i < nr_ranges; i++) {
+            nvme_deallocate_range(n, ns, le64_to_cpu(ranges[i].slba),
+                                  le32_to_cpu(ranges[i].nlb));
+        }
     }
-
-    /*
-     * All ranges valid: deallocate each. Clear the util bits and zero the
-     * backing store so a later read returns deterministic zeros (DLFEAT
-     * DRB=001b) and the Deallocated-or-Unwritten Logical Block error can apply.
-     */
-    for (i = 0; i < nr_ranges; i++) {
-        nvme_deallocate_range(n, ns, le64_to_cpu(ranges[i].slba),
-                              le32_to_cpu(ranges[i].nlb));
-    }
-
     femu_debug("DSM: Total blocks to deallocate: %lu\n", total_blocks);
 
     // Store ranges in request for FTL processing
@@ -1182,6 +1453,145 @@ static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     // Don't free ranges here - FTL will handle them
     req->status = NVME_SUCCESS;
     return NVME_SUCCESS;
+}
+
+/* Apply a staged CDL command after scheduler dispatch and before completion. */
+uint16_t nvme_cdl_execute(FemuCtrl *n, NvmeRequest *req)
+{
+    NvmeNamespace *ns = req->ns;
+    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+    uint32_t nlb;
+    uint64_t data_size;
+    uint64_t data_offset;
+    uint16_t ms;
+    uint16_t status = NVME_SUCCESS;
+    uint16_t injected_status;
+    bool extended;
+
+    if (!req->cdl_staged || req->cdl_executed) {
+        return req->status;
+    }
+    req->cdl_executed = true;
+    if (!ns || req->status != NVME_SUCCESS) {
+        return req->status;
+    }
+    if (cdl_test_take_execution_status(n, &injected_status)) {
+        return injected_status;
+    }
+
+    if (req->cmd_opcode == NVME_CMD_DSM) {
+        status = bbssd_drain_namespace(ns, req->stime, &req->reqlat);
+        if (status) {
+            return status;
+        }
+        for (int i = 0; i < req->dsm_nr_ranges; i++) {
+            nvme_deallocate_range(n, ns,
+                                  le64_to_cpu(req->dsm_ranges[i].slba),
+                                  le32_to_cpu(req->dsm_ranges[i].nlb));
+        }
+        return NVME_SUCCESS;
+    }
+
+    nlb = req->nlb;
+    data_size = (uint64_t)nlb << NVME_ID_NS_LBADS(ns);
+    data_offset = ns->backend_offset +
+                  (req->slba << NVME_ID_NS_LBADS(ns));
+    ms = nvme_ns_ms(ns);
+    extended = req->meta_size &&
+               NVME_ID_NS_FLBAS_EXTENDED(ns->id_ns.flbas);
+
+    if (req->is_write) {
+        nvme_note_user_write(n);
+    }
+    if (femu_pi_type(ns)) {
+        if (req->is_write) {
+            qemu_mutex_lock(&ns->mdata_lock);
+            if (!n->power_loss) {
+                memcpy((uint8_t *)n->mbe->logical_space + data_offset,
+                       req->write_data, data_size);
+                nvme_mark_written(ns, req->slba, nlb);
+            }
+            memcpy(ns->mdata + req->slba * ms, req->meta_buf,
+                   req->meta_size);
+            qemu_mutex_unlock(&ns->mdata_lock);
+            return NVME_SUCCESS;
+        } else {
+            g_autofree uint8_t *data = g_malloc(data_size);
+            g_autofree uint8_t *meta = g_malloc0(req->meta_size);
+
+            femu_pi_snapshot(ns, req->slba, nlb, data, meta);
+            status = femu_pi_check(ns, data, meta, nlb, req->ctrl,
+                                   req->slba, le32_to_cpu(rw->reftag),
+                                   le16_to_cpu(rw->apptag),
+                                   le16_to_cpu(rw->appmask));
+            return status ? status :
+                   femu_pi_transfer(n, ns, &req->cmd, data, meta, true);
+        }
+    }
+
+    if (req->is_write) {
+        if (!n->power_loss) {
+            if (extended) {
+                uint64_t ds = data_size / nlb;
+                uint64_t unit = ds + ms;
+
+                qemu_mutex_lock(&ns->mdata_lock);
+                for (uint32_t i = 0; i < nlb; i++) {
+                    memcpy((uint8_t *)n->mbe->logical_space + data_offset +
+                           i * ds, req->write_data + i * unit, ds);
+                    memcpy(ns->mdata + (req->slba + i) * ms,
+                           req->write_data + i * unit + ds, ms);
+                }
+                qemu_mutex_unlock(&ns->mdata_lock);
+            } else {
+                if (req->meta_size) {
+                    qemu_mutex_lock(&ns->mdata_lock);
+                }
+                memcpy((uint8_t *)n->mbe->logical_space + data_offset,
+                       req->write_data, data_size);
+                if (req->meta_size) {
+                    memcpy(ns->mdata + req->slba * ms, req->meta_buf,
+                           req->meta_size);
+                    qemu_mutex_unlock(&ns->mdata_lock);
+                }
+            }
+            nvme_mark_written(ns, req->slba, nlb);
+        }
+        return NVME_SUCCESS;
+    }
+
+    if (extended) {
+        uint64_t ds = data_size / nlb;
+        uint64_t unit = ds + ms;
+        g_autofree uint8_t *buf = g_malloc((size_t)nlb * unit);
+
+        qemu_mutex_lock(&ns->mdata_lock);
+        for (uint32_t i = 0; i < nlb; i++) {
+            memcpy(buf + i * unit,
+                   (uint8_t *)n->mbe->logical_space + data_offset + i * ds,
+                   ds);
+            memcpy(buf + i * unit + ds,
+                   ns->mdata + (req->slba + i) * ms, ms);
+        }
+        qemu_mutex_unlock(&ns->mdata_lock);
+        return dma_read_cmd(n, &req->cmd, buf, nlb * unit);
+    }
+
+    if (req->meta_size) {
+        qemu_mutex_lock(&ns->mdata_lock);
+    }
+    status = dma_read_cmd(n, &req->cmd,
+                          (uint8_t *)n->mbe->logical_space + data_offset,
+                          data_size);
+    if (!status && req->meta_size &&
+        femu_dma_write(n, req->mptr, ns->mdata + req->slba * ms,
+                       req->meta_size)) {
+        status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+    }
+    if (req->meta_size) {
+        qemu_mutex_unlock(&ns->mdata_lock);
+    }
+    return status;
 }
 
 /*
@@ -1958,6 +2368,9 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
         }
         femu_err("%s, NVME_INVALID_NSID %" PRIu32 "\n", __func__, nsid);
         return NVME_INVALID_NSID | NVME_DNR;
+    }
+    if (cmd->fuse) {
+        return NVME_INVALID_FIELD | NVME_DNR;
     }
 
     switch (cmd->opcode) {

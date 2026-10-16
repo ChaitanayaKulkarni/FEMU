@@ -10,6 +10,7 @@
 #include "./nvme.h"
 #include "./bbssd/ftl.h"
 #include "./femu-props.h"
+#include "trace.h"
 
 #define NVME_SPEC_VER (0x00010400)
 
@@ -438,6 +439,7 @@ static void nvme_reset_features(FemuCtrl *n)
     n->features.volatile_wc     = n->vwc;
     n->features.nr_io_queues    = (n->nr_io_queues - 1) |
                                   ((n->nr_io_queues - 1) << 16);
+    n->io_queues_created = false;
     n->features.int_coalescing  = n->intc_thresh | (n->intc_time << 8);
     n->features.write_atomicity = 0;
     n->features.async_config    = 0x0;
@@ -527,25 +529,8 @@ static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
     nvme_reset_features(n);
     n->temp_warn_issued = 0;
 
-    /* TP4221 CDL: full state reset per ABI §8 */
-    pthread_spin_lock(&n->cdl_lock);
-    n->cdl_enabled = false;
-    memset(n->cdl_read,  0, sizeof(n->cdl_read));
-    memset(n->cdl_write, 0, sizeof(n->cdl_write));
-    memset(n->cdl_stats, 0, sizeof(n->cdl_stats));
-    /*
-     * nvme_free_sq() sets n->sq[sqid]=NULL before freeing the struct, so
-     * every slot is already NULL here — the loop runs zero iterations and
-     * touches no freed memory.  Kept for completeness in case of partial
-     * teardown paths added in the future.
-     */
-    for (i = 1; i <= n->nr_io_queues; i++) {
-        if (n->sq[i]) {
-            n->sq[i]->cdl_class = 0;
-        }
-    }
-    pthread_spin_unlock(&n->cdl_lock);
     wfq_init(n);
+    cdl_reset(n);
     /*
      * Release the doorbell buffers as well as forgetting them: each enable and
      * configure took a mapping reference that only the device going away gave
@@ -618,7 +603,8 @@ static int nvme_start_ctrl(FemuCtrl *n)
     uint32_t page_bits = NVME_CC_MPS(n->bar.cc) + 12;
     uint32_t page_size = 1 << page_bits;
 
-    if (n->cq[0] || n->sq[0] || !n->bar.asq || !n->bar.acq ||
+    if (n->cdl_store_failed || n->cq[0] || n->sq[0] ||
+        !n->bar.asq || !n->bar.acq ||
         n->bar.asq & (page_size - 1) || n->bar.acq & (page_size - 1) ||
         NVME_CC_MPS(n->bar.cc) < NVME_CAP_MPSMIN(n->bar.cap) ||
         NVME_CC_MPS(n->bar.cc) > NVME_CAP_MPSMAX(n->bar.cap) ||
@@ -656,7 +642,7 @@ static int nvme_start_ctrl(FemuCtrl *n)
         return -1;
     }
     if (nvme_init_sq(&n->admin_sq, n, n->bar.asq, 0, 0,
-                     NVME_AQA_ASQS(n->bar.aqa) + 1, NVME_Q_PRIO_HIGH, 1)) {
+                     NVME_AQA_ASQS(n->bar.aqa) + 1, NVME_Q_PRIO_HIGH, 1, 0)) {
         nvme_free_cq(&n->admin_cq, n);
         return -1;
     }
@@ -1717,8 +1703,28 @@ static void nvme_init_ctrl(FemuCtrl *n)
         id->endgidmax = cpu_to_le16(1);
     }
 
-    /* TP4221: advertise CDL support unconditionally (CTRATT bit 28) */
-    id->ctratt |= cpu_to_le32(NVME_CTRATT_CDLSUPP);
+    if (n->cdl_profile) {
+        uint8_t *profile = id->vs + CDL_IDENTIFY_VS_OFFSET;
+
+        id->ctratt |= cpu_to_le32(NVME_CTRATT_CDLSUPP);
+        memset(profile, 0, CDL_IDENTIFY_HEADER_BYTES);
+        memcpy(profile, "CDL2FEMU", 8);
+        stw_le_p(profile + 8, CDL_IDENTIFY_MAJOR);
+        stw_le_p(profile + 10, CDL_IDENTIFY_MINOR);
+        stw_le_p(profile + 12, CDL_IDENTIFY_HEADER_BYTES);
+        stw_le_p(profile + 14, n->cdl_num_classes);
+        profile[16] = NVME_CDL_CFG;
+        profile[17] = CDL_LOG_PAGE_C0;
+        profile[18] = CDL_LOG_PAGE_C1;
+        profile[19] = CDL_POLICY_BEST_EFFORT;
+        stl_le_p(profile + 20, CDL_IDENTIFY_FLAGS);
+        memcpy(profile + 24, "TP4221V2", 8);
+        stw_le_p(profile + 32, n->cdl_queue_caps.max_io_sqs);
+        stw_le_p(profile + 34, n->cdl_queue_caps.max_io_cqs);
+        stw_le_p(profile + 36, n->cdl_queue_caps.max_cdl_sqs);
+        stw_le_p(profile + 38, n->cdl_queue_caps.sqs_per_class);
+        stw_le_p(profile + 40, n->cdl_queue_caps.bound_classes);
+    }
 
     id->oacs         = cpu_to_le16(n->oacs | NVME_OACS_DBBUF | NVME_OACS_DST |
                                    NVME_OACS_GLSS);
@@ -1837,12 +1843,16 @@ static uint64_t femu_ftl_process_req(FemuCtrl *n, NvmeRequest *req)
         return 0;
     }
 
+    if (req->cdl_staged && !req->cdl_executed) {
+        req->status = nvme_cdl_execute(n, req);
+    }
+
     /* The medium's own worker uses the same FTL; it serializes both. */
     if (n->cxl_media && ns->ssd_borrowed) {
         return femu_cxl_nvme_ops->ftl(n, ns, req);
     }
 
-    if (n->power_loss) {
+    if (n->power_loss && !req->cdl_staged) {
         if (req->status != NVME_SUCCESS) {
             return 0;
         }
@@ -1889,7 +1899,7 @@ static void *femu_ftl_thread(void *arg)
          * admin command that frees queue state relies on that to know nothing
          * holds a request.
          */
-        if (!n->dataplane_started) {
+        if (!n->dataplane_started || qatomic_read(&n->cdl_store_failed)) {
             n->ftl_in_sweep = false;
             usleep(100);
             continue;
@@ -1915,6 +1925,15 @@ static void *femu_ftl_thread(void *arg)
             rc = femu_ring_dequeue(n->to_ftl[i], (void *)&req, 1);
             if (rc != 1) {
                 femu_err("FEMU: FTL to_ftl dequeue failed\n");
+                n->ftl_in_sweep = false;
+                continue;
+            }
+
+            /* Retry retained CDL work as soon as a backend-ring slot opens. */
+            cdl_dispatch(n);
+
+            if (req->cdl_admitted &&
+                !cdl_test_barrier_wait(n, CDL_BARRIER_DISPATCH)) {
                 n->ftl_in_sweep = false;
                 continue;
             }
@@ -1946,10 +1965,34 @@ static void *femu_ftl_thread(void *arg)
             req->reqlat = lat;
             req->expire_time += lat;
 
-            rc = femu_ring_enqueue(n->to_poller[i], (void *)&req, 1);
-            if (rc != 1) {
-                femu_err("FEMU: FTL to_poller enqueue failed\n");
+            if (req->cdl_admitted) {
+                nvme_apply_service_delay(n, req);
+                /* Modeled service completes before the completion ring. */
+                while (nvme_io_clock(n) < req->expire_time &&
+                       qatomic_read(&n->dataplane_started) && !n->ftl_stopping) {
+                    g_usleep(50);
+                }
+                if (!qatomic_read(&n->dataplane_started) || n->ftl_stopping) {
+                    n->ftl_in_sweep = false;
+                    continue;
+                }
+                cdl_test_advance(n, CDL_TEST_DELAY_BACKEND);
+                trace_femu_cdl_backend_complete(n->cdl_trace_id, req->cdl_attempt,
+                    req->sq->sqid, le16_to_cpu(req->cmd.cid),
+                    req->wfq_cdl_class, req->status, cdl_clock_now_ns(n));
+                if (!cdl_account(n, req)) {
+                    n->ftl_in_sweep = false;
+                    continue;
+                }
             }
+            /* Retain ownership while completion service is backpressured. */
+            do {
+                rc = femu_ring_enqueue(n->to_poller[i], (void *)&req, 1);
+                if (rc != 1) {
+                    g_usleep(50);
+                }
+            } while (rc != 1 && qatomic_read(&n->dataplane_started) &&
+                     !n->ftl_stopping && !n->cdl_store_failed);
 
             n->ftl_in_sweep = false;
         }
@@ -2278,6 +2321,10 @@ static void femu_realize_undo(FemuCtrl *n)
     if (msix_present(&n->parent_obj)) {
         msix_uninit_exclusive_bar(&n->parent_obj);
     }
+    pthread_spin_destroy(&n->pcie_lock);
+    pthread_spin_destroy(&n->fw_cpu_lock);
+    cdl_exit(n);
+    pthread_spin_destroy(&n->cdl_lock);
 }
 
 /*
@@ -2414,9 +2461,10 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     pthread_spin_init(&n->pcie_lock, PTHREAD_PROCESS_PRIVATE);
     pthread_spin_init(&n->fw_cpu_lock, PTHREAD_PROCESS_PRIVATE);
     pthread_spin_init(&n->cdl_lock, PTHREAD_PROCESS_PRIVATE);
-    wfq_init(n);
-    g_assert(n->wfq_depth > 0 && n->wfq_depth <= FEMU_MAX_INF_REQS);
-    wfq_recompute_limits(n);
+    if (!cdl_init(n, errp)) {
+        femu_realize_undo(n);
+        return;
+    }
 
     n->completed = 0;
     n->power_on_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -2643,6 +2691,10 @@ static void nvme_destroy_poller(FemuCtrl *n)
     n->poller_args = NULL;
     g_free(n->should_isr);
     g_free(n->cpl_backlog);
+    g_free(n->ftl_backlog);
+    n->ftl_backlog = NULL;
+    g_free(n->ftl_backlog_count);
+    n->ftl_backlog_count = NULL;
     g_free((void *)n->poller_in_sweep);
     n->poller_in_sweep = NULL;
     qemu_vfree(n->poller_ctr);   /* allocated with qemu_memalign */
@@ -2745,6 +2797,7 @@ static void femu_exit(PCIDevice *pci_dev)
     }
     pthread_spin_destroy(&n->pcie_lock);
     pthread_spin_destroy(&n->fw_cpu_lock);
+    cdl_exit(n);
     pthread_spin_destroy(&n->cdl_lock);
 
     /* FDP: unregister controller from subsystem */
@@ -2789,6 +2842,15 @@ static const Property femu_props[] = {
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
     DEFINE_PROP_UINT32("queues", FemuCtrl, nr_io_queues, 8),
     DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
+    DEFINE_PROP_BOOL("cdl", FemuCtrl, cdl_profile, false),
+    DEFINE_PROP_UINT16("cdl_classes", FemuCtrl, cdl_num_classes, 256),
+    DEFINE_PROP_UINT16("cdl_max_sqs", FemuCtrl,
+                       cdl_queue_caps.max_cdl_sqs, 0),
+    DEFINE_PROP_UINT16("cdl_sqs_per_class", FemuCtrl,
+                       cdl_queue_caps.sqs_per_class, 0),
+    DEFINE_PROP_UINT16("cdl_bound_classes", FemuCtrl,
+                       cdl_queue_caps.bound_classes, 0),
+    DEFINE_PROP_STRING("cdl_file", FemuCtrl, cdl_file),
     DEFINE_PROP_UINT32("wfq_depth", FemuCtrl, wfq_depth, 64),
     DEFINE_PROP_UINT8("multipoller_enabled", FemuCtrl, multipoller_enabled, 0),
     DEFINE_PROP_UINT32("poller_ratio", FemuCtrl, poller_ratio, 1),
@@ -3112,6 +3174,28 @@ static void femu_test_oc12_clock(Object *obj, bool value, Error **errp)
     n->test_oc12_clock = value;
 }
 
+static void femu_test_cdl(Object *obj, const char *value, Error **errp)
+{
+    FemuCtrl *n = FEMU(obj);
+
+    if (!DEVICE(obj)->realized) {
+        error_setg(errp, "x-cdl-test requires a realized controller");
+        return;
+    }
+    cdl_test_command(n, value, errp);
+}
+
+static char *femu_test_cdl_state(Object *obj, Error **errp)
+{
+    FemuCtrl *n = FEMU(obj);
+
+    if (!DEVICE(obj)->realized || !n->cdl_profile) {
+        error_setg(errp, "x-cdl-test-state requires a realized CDL controller");
+        return NULL;
+    }
+    return cdl_test_state(n);
+}
+
 /* A cut resets command state; the caller must enable the controller again. */
 static void femu_simulate_power_loss(Object *obj, bool value, Error **errp)
 {
@@ -3155,6 +3239,9 @@ static void femu_instance_init(Object *obj)
         object_property_add_str(obj, "x-stream-test", nvme_streams_test, NULL);
         object_property_add_str(obj, "x-ns-test", NULL, femu_test_namespace);
         object_property_add_str(obj, "x-ftl-check", femu_test_ftl_check, NULL);
+        object_property_add_str(obj, "x-cdl-test", NULL, femu_test_cdl);
+        object_property_add_str(obj, "x-cdl-test-state",
+                                femu_test_cdl_state, NULL);
     }
 }
 

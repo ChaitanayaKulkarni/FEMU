@@ -22,7 +22,7 @@ Devices:
 
 ## `femu`: NVMe controller
 
-`-device femu` has 145 properties of its own and 1 QOM property listed in [runtime-properties.md](runtime-properties.md).
+`-device femu` has 152 properties of its own and 1 QOM property listed in [runtime-properties.md](runtime-properties.md).
 
 ### Mode, capacity and namespaces
 
@@ -57,6 +57,18 @@ Devices:
 | `intc` | `uint8` | `0` | Initial Coalescing Disable bit (0 or 1) of the Interrupt Vector Configuration feature; the value is reported, interrupts are not coalesced |
 | `intc_thresh` | `uint8` | `0` | Initial aggregation threshold of the Interrupt Coalescing feature; the value is reported, interrupts are not coalesced |
 | `intc_time` | `uint8` | `0` | Initial aggregation time, in 100 microsecond units, of the Interrupt Coalescing feature; the value is reported, interrupts are not coalesced |
+
+### TP4221 CDL experimental profile
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cdl` | `bool` | `off` | Enable the Identify 2.1 / log 2.0 TP4221 CDL experimental FEMU profile; requires PCI vid=0x8086, did=0x5845, ONCS Save/Select support and cdl_file; OpenChannel mode is unsupported |
+| `cdl_classes` | `uint16` | `256` | Number of CDL class identifiers including bypass class 0, from 1 to 256; IDs are 0 through cdl_classes - 1 |
+| `cdl_max_sqs` | `uint16` | `0` | Aggregate nonzero-class SQ capacity; explicit with cdl=on and N>1, at most queues; zero for bypass-only N=1 |
+| `cdl_sqs_per_class` | `uint16` | `0` | Uniform SQ limit for each nonzero class; explicit with N>1, positive and at most cdl_max_sqs; zero for N=1 |
+| `cdl_bound_classes` | `uint16` | `0` | Distinct bound nonzero-class limit; explicit with N>1, positive and less than cdl_classes; zero for N=1 |
+| `cdl_file` | `str` | unset | Controller-specific durable CDL configuration, counter and replay store; required with cdl=on and never shared between controllers |
+| `wfq_depth` | `uint32` | `64` | Global maximum number of dispatched timed CDL commands, from 1 to the controller request limit |
 
 ### Controller identity and capabilities
 
@@ -335,7 +347,7 @@ QEMU's internal compatibility properties (`x-max-bounce-buffer-size`, `x-pcie-ar
 
 These exist only when QEMU runs under qtest (`-accel qtest`) and serve FEMU's own tests. They are not part of the user interface.
 
-- `femu`: `x-ftl-check`, `x-ns-test`, `x-oc12-clock`, `x-stream-test`
+- `femu`: `x-cdl-test`, `x-cdl-test-state`, `x-ftl-check`, `x-ns-test`, `x-oc12-clock`, `x-stream-test`
 - `femu-cxl-ssd`: `test-change-dpa`, `test-media-disabled`, `test-slot-reservation`
 
 ## Environment variables

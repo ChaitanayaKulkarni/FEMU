@@ -579,6 +579,18 @@ void nvme_drain_sq(FemuCtrl *n, NvmeSQueue *sq)
                 }
             }
         }
+        if (n->ftl_backlog) {
+            NvmeRequest *next;
+
+            QTAILQ_FOREACH_SAFE(req, &n->ftl_backlog[p], entry, next) {
+                if (req->sq == sq) {
+                    QTAILQ_REMOVE(&n->ftl_backlog[p], req, entry);
+                    assert(qatomic_read(&n->ftl_backlog_count[p]));
+                    qatomic_set(&n->ftl_backlog_count[p],
+                                qatomic_read(&n->ftl_backlog_count[p]) - 1);
+                }
+            }
+        }
 
         if (!n->pq || !n->pq[p]) {
             continue;
@@ -714,6 +726,7 @@ void nvme_retire_ns_requests(FemuCtrl *n, NvmeNamespace *ns)
 
 void nvme_free_sq(NvmeSQueue *sq, FemuCtrl *n)
 {
+    cdl_sq_deleted(n, sq);
     n->sq[sq->sqid] = NULL;
     if (sq->dma_addr_hva) {
         dma_memory_unmap(pci_get_address_space(&n->parent_obj),
@@ -736,7 +749,7 @@ void nvme_free_sq(NvmeSQueue *sq, FemuCtrl *n)
 
 uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
                       sqid, uint16_t cqid, uint16_t size, enum NvmeQueueFlags
-                      prio, int contig)
+                      prio, int contig, uint8_t cdl_class)
 {
     uint8_t stride = n->db_stride;
     int dbbuf_entry_sz = 1 << (2 + stride);
@@ -751,6 +764,8 @@ uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
     sq->cqid = cqid;
     sq->head = sq->tail = 0;
     sq->phys_contig = contig;
+    sq->cdl_class = cdl_class;
+    QTAILQ_INIT(&sq->cdl_pending);
     if (sq->phys_contig) {
         void *hva = dma_memory_map(as, dma_addr, &sqsz, 0,
                                    MEMTXATTRS_UNSPECIFIED);
@@ -810,6 +825,10 @@ uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
         sq->db_addr_hva = n->dbs_addr_hva + 2 * sqid * dbbuf_entry_sz;
         sq->eventidx_addr = n->eis_addr + 2 * sqid * dbbuf_entry_sz;
         sq->eventidx_addr_hva = n->eis_addr_hva + 2 * sqid * dbbuf_entry_sz;
+        /* EI belongs to the controller. Initialize a newly created QID
+         * before publishing it to the poller, including live recreation.
+         */
+        stl_le_p((void *)sq->eventidx_addr_hva, sq->tail);
         femu_debug("SQ[%d],db=%" PRIu64 ",ei=%" PRIu64 "\n", sqid, sq->db_addr,
                 sq->eventidx_addr);
     }
@@ -873,6 +892,7 @@ uint16_t nvme_init_cq(NvmeCQueue *cq, FemuCtrl *n, uint64_t dma_addr, uint16_t
         cq->db_addr_hva = n->dbs_addr_hva + (2 * cqid + 1) * dbbuf_entry_sz;
         cq->eventidx_addr = n->eis_addr + (2 * cqid + 1) * dbbuf_entry_sz;
         cq->eventidx_addr_hva = n->eis_addr_hva + (2 * cqid + 1) * dbbuf_entry_sz;
+        stl_le_p((void *)cq->eventidx_addr_hva, cq->head);
         femu_debug("CQ, db_addr=%" PRIu64 ", eventidx_addr=%" PRIu64 "\n",
                     cq->db_addr, cq->eventidx_addr);
     }

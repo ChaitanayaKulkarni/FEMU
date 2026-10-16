@@ -1142,6 +1142,7 @@ enum NvmeLogIdentifier {
     NVME_LOG_TELEMETRY_CTRL = 0x08,
     NVME_LOG_PERSISTENT_EVENT = 0x0d,
     NVME_LOG_LBA_STATUS     = 0x0e,
+    NVME_LOG_FEATURE_EFFECTS = 0x12,
     NVME_LOG_ENDGRP         = 0x09,
     NVME_LOG_FDP_CONFS      = 0x20,
     NVME_LOG_FDP_RUH_USAGE  = 0x21,
@@ -1332,7 +1333,8 @@ enum NvmeIdCtrlOncs {
     NVME_ONCS_WRITE_UNCORR  = 1 << 1,
     NVME_ONCS_DSM           = 1 << 2,
     NVME_ONCS_WRITE_ZEROS   = 1 << 3,
-    NVME_ONCS_FEATURES      = 1 << 4,
+    NVME_ONCS_SSFS          = 1 << 4,
+    NVME_ONCS_FEATURES      = NVME_ONCS_SSFS,
     NVME_ONCS_RESRVATIONS   = 1 << 5,
     NVME_ONCS_TIMESTAMP     = 1 << 6,
     NVME_ONCS_VERIFY        = 1 << 7,
@@ -1454,79 +1456,120 @@ typedef struct NvmeLBAF {
     uint8_t     rp;
 } NvmeLBAF;
 
-/* TP4221 CDL structs — sizes fixed by CDL_WFQ_ABI_v1.1.txt §4/§5 */
+/* TP4221 CDL v2 experimental profile. */
+#define CDL_MAX_CLASSES           256     /* class IDs 0-255; 0 is bypass */
+#define CDL_POLICY_BEST_EFFORT    0x02
+#define CDL_LOG_PAGE_C0           0xc0
+#define CDL_LOG_PAGE_C1           0xc1
+#define CDL_IDENTIFY_MAJOR        2
+#define CDL_IDENTIFY_MINOR        1
+#define CDL_LOG_MAJOR             2
+#define CDL_LOG_MINOR             0
+#define CDL_LOG_HEADER_BYTES      64
+#define CDL_CONFIG_ENTRY_BYTES    16
+#define CDL_STATS_ENTRY_BYTES     24
+#define CDL_IDENTIFY_VS_OFFSET    0
+#define CDL_IDENTIFY_HEADER_BYTES 64
+#define CDL_IDENTIFY_FLAGS        3
+#define WFQ_SCALE                 1000000ULL
 
-#define CDL_MAX_CLASSES     8       /* classes 0-7; class 0 = bypass */
-#define CDL_MAX_CLASS_INDEX  (CDL_MAX_CLASSES - 1)   /* max valid class index = 7 */
-#define CDL_MAX_NS          100000000ULL  /* 100 ms in nanoseconds — max duration_ns */
-#define WFQ_SCALE           1000000ULL   /* fixed-point scale for virtual tags */
-#define CDL_LOG_PAGE_C0     0xc0    /* CDL class descriptor log */
-#define CDL_LOG_PAGE_C1     0xc1    /* CDL per-class statistics log */
-#define CDL_ABI_VERSION     1
-#define CDL_PAGE_VERSION    1
+/* Host-endian, immutable realized capacities; not volatile usage counters. */
+typedef struct NvmeCdlQueueCaps {
+    uint16_t max_io_sqs;
+    uint16_t max_io_cqs;
+    uint16_t max_cdl_sqs;
+    uint16_t sqs_per_class;
+    uint16_t bound_classes;
+} NvmeCdlQueueCaps;
 
-/* Per-class command duration limit descriptor (16 bytes) */
-typedef struct QEMU_PACKED NvmeCdlDescriptor {
-    uint64_t    duration_ns;    /* CDL duration limit; 0 = class disabled */
-    uint32_t    guide_ns;       /* informational guide latency */
-    uint16_t    desc_gen;       /* descriptor generation; init=0, first set→1,
-                                 * wraps 65535→1 (never wraps to 0) */
-    uint8_t     policy;         /* 0=soft/report-only (v1); 1-3 reserved */
-    uint8_t     reserved;
+/* Layout documentation/checks only: serialize each field little endian. */
+typedef struct QEMU_PACKED NvmeCdlIdentify {
+    uint8_t magic[8];
+    uint16_t major;
+    uint16_t minor;
+    uint16_t header_bytes;
+    uint16_t classes;
+    uint8_t fid;
+    uint8_t config_lid;
+    uint8_t stats_lid;
+    uint8_t policy;
+    uint32_t flags;
+    uint8_t tag[8];
+    uint16_t max_io_sqs;
+    uint16_t max_io_cqs;
+    uint16_t max_cdl_sqs;
+    uint16_t sqs_per_class;
+    uint16_t bound_classes;
+    uint8_t reserved[22];
+} NvmeCdlIdentify;
+
+typedef struct NvmeCdlDescriptor {
+    uint32_t duration_us;        /* zero means unconfigured */
+    uint8_t policy;              /* CDL_POLICY_BEST_EFFORT when configured */
 } NvmeCdlDescriptor;
 
-/* Log Page 0xC0 — CDL class descriptors (512 bytes) */
-typedef struct QEMU_PACKED NvmeCdlLogPage0xC0 {
-    /* 16-byte header */
-    uint16_t            page_version;           /* bytes 0-1 */
-    uint16_t            num_classes;            /* bytes 2-3 */
-    uint8_t             cdl_version;            /* byte 4 */
-    uint8_t             cdl_flags;              /* byte 5; bit 0 = CDL enabled */
-    uint8_t             hdr_reserved[10];       /* bytes 6-15 */
-    /* Read descriptors at offset 16 (8 × 16 = 128 bytes) */
-    NvmeCdlDescriptor   read[CDL_MAX_CLASSES];
-    /* Write descriptors at offset 144 (8 × 16 = 128 bytes) */
-    NvmeCdlDescriptor   write[CDL_MAX_CLASSES];
-    /* Padding to 512 bytes */
-    uint8_t             pad[240];
-} NvmeCdlLogPage0xC0;
-
-/* Per-class statistics entry (24 bytes) */
-typedef struct QEMU_PACKED NvmeCdlClassStats {
-    uint64_t    miss_count;     /* CDL deadline misses for this class */
-    uint64_t    last_miss_ns;   /* QEMU_CLOCK_VIRTUAL at last miss */
-    uint64_t    completions;    /* total completions for this class */
+typedef struct NvmeCdlClassStats {
+    uint64_t timed;
+    uint64_t misses;
+    bool timed_saturated;
+    bool misses_saturated;
 } NvmeCdlClassStats;
 
-/* Log Page 0xC1 — CDL per-class statistics (256 bytes) */
-typedef struct QEMU_PACKED NvmeCdlLogPage0xC1 {
-    /* 8-byte header */
-    uint16_t            version;                /* bytes 0-1 */
-    uint8_t             hdr_reserved[6];        /* bytes 2-7 */
-    /* Per-class stats at offset 8 (8 × 24 = 192 bytes) */
-    NvmeCdlClassStats   stats[CDL_MAX_CLASSES];
-    /* Padding to 256 bytes */
-    uint8_t             pad[56];
-} NvmeCdlLogPage0xC1;
+/* qtest-only virtual-time and durable-store injection points. */
+typedef enum NvmeCdlTestDelay {
+    CDL_TEST_DELAY_FETCH,
+    CDL_TEST_DELAY_VALIDATION,
+    CDL_TEST_DELAY_QUEUE,
+    CDL_TEST_DELAY_BACKEND,
+    CDL_TEST_DELAY_DURABLE,
+    CDL_TEST_DELAY_CQ,
+    CDL_TEST_DELAY_MAX,
+} NvmeCdlTestDelay;
+
+typedef enum NvmeCdlTestFault {
+    CDL_TEST_FAULT_NONE,
+    CDL_TEST_FAULT_TXN_OPEN,
+    CDL_TEST_FAULT_TXN_WRITE,
+    CDL_TEST_FAULT_TXN_FSYNC,
+    CDL_TEST_FAULT_TXN_RENAME,
+    CDL_TEST_FAULT_TXN_DIRSYNC,
+    CDL_TEST_FAULT_STORE_OPEN,
+    CDL_TEST_FAULT_STORE_WRITE,
+    CDL_TEST_FAULT_STORE_FSYNC,
+    CDL_TEST_FAULT_STORE_RENAME,
+    CDL_TEST_FAULT_STORE_DIRSYNC,
+    CDL_TEST_FAULT_AFTER_INTENT,
+    CDL_TEST_FAULT_AFTER_STORE,
+    CDL_TEST_FAULT_BEFORE_UNLINK,
+    CDL_TEST_FAULT_AFTER_UNLINK,
+} NvmeCdlTestFault;
+
+typedef enum NvmeCdlTestBarrier {
+    CDL_BARRIER_NONE,
+    CDL_BARRIER_FETCH,
+    CDL_BARRIER_BEFORE_ADMISSION,
+    CDL_BARRIER_AFTER_ADMISSION,
+    CDL_BARRIER_CHECK,
+    CDL_BARRIER_DURABLE,
+    CDL_BARRIER_CQ,
+    CDL_BARRIER_DISPATCH,
+    CDL_BARRIER_POST_CQ,
+} NvmeCdlTestBarrier;
+
+typedef struct NvmeCdlTestDispatch {
+    uint16_t sqid;
+    uint16_t cid;
+    uint8_t cls;
+} NvmeCdlTestDispatch;
+
+#define CDL_TEST_DISPATCH_LOG_ENTRIES 22000
 
 /* CDL Set/Get Features CDW11 CDLOP field (bits 1:0 of CDW11) */
 #define CDL_CDLOP(dw11)         ((dw11) & 0x3)
 #define CDL_CDLOP_ENABLE        0x0     /* CDW11[1:0]=00b: enable/disable */
-#define CDL_CDLOP_BIND          0x1     /* CDW11[1:0]=01b: bind SQ to class */
-#define CDL_CDLOP_SET_DESC      0x2     /* CDW11[1:0]=10b: set descriptor */
+#define CDL_CDLOP_QUEUE_CLASS   0x1     /* Get only */
+#define CDL_CDLOP_DESC          0x2
 #define CDL_CDLOP_INVALID       0x3     /* CDW11[1:0]=11b: reserved */
-
-/* CDL status codes (SCT=7h vendor-specific, assembled as (7<<9)|SC) */
-#define CDL_STATUS(sc)          (NVME_SCT_VENDOR_SPECIFIC << 9 | (sc))
-#define CDL_STATUS_BUSY               CDL_STATUS(0x01)  /* scheduler not idle */
-#define CDL_STATUS_DESCRIPTOR_NOT_SET CDL_STATUS(0x02)  /* bound class duration=0 */
-#define CDL_STATUS_INVALID_DURATION   CDL_STATUS(0x03)  /* DURATION=0 or >CDL_MAX_NS */
-#define CDL_STATUS_INVALID_POLICY     CDL_STATUS(0x04)  /* POLICY not 00b in v1 */
-#define CDL_STATUS_INVALID_CLASS      CDL_STATUS(0x05)  /* CLASS>MAXE2ECLASSES */
-
-#ifndef NVME_SCT_VENDOR_SPECIFIC
-#define NVME_SCT_VENDOR_SPECIFIC 0x7
-#endif
 
 #define NVME_NSID_BROADCAST 0xffffffff
 
@@ -1630,6 +1673,16 @@ static inline void nvme_check_size(void)
     QEMU_BUILD_BUG_ON(sizeof(FemuStatsLog) != 512);
     QEMU_BUILD_BUG_ON(sizeof(NvmeTelemetryLog) != 512);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdCtrl) != 4096);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeIdCtrl, ctratt) != 96);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeIdCtrl, sqes) != 512);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeIdCtrl, cqes) != 513);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeIdCtrl, maxcmd) != 514);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeIdCtrl, sgls) != 536);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeIdCtrl, vs) != 3072);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlIdentify) != CDL_IDENTIFY_HEADER_BYTES);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeCdlIdentify, max_io_sqs) != 32);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeCdlIdentify, bound_classes) != 40);
+    QEMU_BUILD_BUG_ON(offsetof(NvmeCdlIdentify, reserved) != 42);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdNs) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpConfsHdr) != 16);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpDescrHdr) != 64);
@@ -1638,11 +1691,6 @@ static inline void nvme_check_size(void)
     QEMU_BUILD_BUG_ON(sizeof(NvmeRuhuDescr) != 8);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpStatsLog) != 64);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpEventsLog) != 64);
-    /* TP4221 CDL struct sizes — must match ABI v1.1 §4/§5 */
-    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlDescriptor)   != 16);
-    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlLogPage0xC0)  != 512);
-    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlClassStats)   != 24);
-    QEMU_BUILD_BUG_ON(sizeof(NvmeCdlLogPage0xC1)  != 256);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpEvent) != 64);
     QEMU_BUILD_BUG_ON(sizeof(NvmeFdpEventDescr) != 2);
     QEMU_BUILD_BUG_ON(sizeof(NvmeRuhStatus) != 16);
@@ -1751,14 +1799,27 @@ typedef struct NvmeRequest {
      */
     void            (*defer)(FemuCtrl *n, struct NvmeRequest *req, int poller);
 
-    /* TP4221 WFQ scheduler fields — valid when wfq_cdl_class != 0 */
-    uint64_t        wfq_virt_finish;    /* SCFQ virtual finish tag F(c,k) */
-    int64_t         wfq_ingestion_ns;   /* QEMU_CLOCK_VIRTUAL at enqueue */
-    uint8_t         wfq_cdl_class;      /* class at ingestion; 0 = bypass */
-    int             wfq_poller_idx;     /* poller that submitted this request */
-    QTAILQ_ENTRY(NvmeRequest) wfq_entry;          /* linkage in per-class FIFO */
-    QTAILQ_ENTRY(NvmeRequest) wfq_inflight_entry; /* linkage in per-class in-flight list */
-    bool wfq_orphaned; /* set under cdl_lock by SQ delete; suppresses stats on completion */
+    /* TP4221 CDL capture and scheduler ownership. */
+    uint64_t        wfq_virt_finish;
+    uint64_t        cdl_attempt;
+    int64_t         cdl_start_ns;
+    int64_t         cdl_stop_ns;
+    int64_t         cdl_elapsed_ns;
+    uint64_t        cdl_duration_ns;
+    uint8_t         wfq_cdl_class;
+    uint8_t         cdl_policy;
+    int             wfq_poller_idx;
+    bool            cdl_staged;
+    bool            cdl_admitted;
+    bool            cdl_executed;
+    bool            cdl_timed;
+    bool            cdl_checked;
+    bool            cdl_miss;
+    bool            cdl_accounted;
+    bool            cdl_cq_delay_applied;
+    bool            wfq_orphaned;
+    QTAILQ_ENTRY(NvmeRequest) wfq_entry;
+    QTAILQ_ENTRY(NvmeRequest) wfq_inflight_entry;
 } NvmeRequest;
 
 typedef struct DMAOff {
@@ -1793,10 +1854,10 @@ typedef struct NvmeSQueue {
     uint64_t    eventidx_addr_hva;
     bool        is_active;
 
-    /* TP4221 CDL: class binding, set at runtime via Set Features FID 0xC0 */
-    uint8_t     cdl_class;      /* 0 = no CDL (bypass), 1-7 = CDL class */
-    uint16_t    cdl_desc_gen;   /* desc_gen snapshot at bind time; stale if
-                                 * descriptor was updated after binding */
+    /* TP4221 CDL: immutable Create I/O SQ class binding. */
+    uint8_t     cdl_class;
+    bool        cdl_quota_reserved;
+    QTAILQ_HEAD(, NvmeRequest) cdl_pending;
 } NvmeSQueue;
 
 typedef struct NvmeCQueue {
@@ -2365,21 +2426,66 @@ typedef struct FemuCtrl {
 
     Oc12Ctrl  *oc12_ctrl;
 
-    /* TP4221 CDL state — protected by cdl_lock from poller threads */
-    bool                cdl_enabled;                        /* Set Features CDLOP=00b */
-    NvmeCdlDescriptor   cdl_read[CDL_MAX_CLASSES];          /* read class descriptors */
-    NvmeCdlDescriptor   cdl_write[CDL_MAX_CLASSES];         /* write class descriptors */
-    NvmeCdlClassStats   cdl_stats[CDL_MAX_CLASSES];         /* per-class miss/completion counters */
-    pthread_spinlock_t  cdl_lock;                           /* guards all CDL + WFQ state */
+    /* TP4221 CDL v2 state. cdl_lock guards runtime state and snapshots. */
+    bool                cdl_enabled;
+    bool                cdl_saved_enabled;
+    bool                cdl_saved_enabled_present;
+    bool                cdl_profile;
+    bool                cdl_store_failed;
+    uint16_t            cdl_num_classes;
+    NvmeCdlQueueCaps    cdl_queue_caps;
+    uint32_t            cdl_sqs_used;
+    uint32_t            cdl_bound_used;
+    bool                io_queues_created; /* epoch history, survives Delete */
+    NvmeCdlDescriptor   *cdl_desc;
+    NvmeCdlDescriptor   *cdl_saved_desc;
+    bool                *cdl_saved_desc_present;
+    NvmeCdlClassStats   *cdl_stats;
+    uint32_t            *cdl_assoc;
+    uint64_t            cdl_generation;
+    uint64_t            cdl_snapshot_seq;
+    uint64_t            cdl_last_txid;
+    uint8_t             cdl_store_id[16];
+    char                cdl_trace_id[33];
+    uint64_t            cdl_attempt_seq;
+    char                *cdl_file;
+    pthread_spinlock_t  cdl_lock;
+    QemuMutex           cdl_store_lock;
 
-    /* TP4221 WFQ scheduler state — protected by cdl_lock */
-    uint32_t            wfq_inflight[CDL_MAX_CLASSES];          /* commands in FTL for class c */
-    uint32_t            wfq_max_inflight[CDL_MAX_CLASSES];      /* weight-proportional dispatch cap */
-    uint32_t            wfq_depth;                              /* total CDL in-flight capacity (device prop) */
-    QTAILQ_HEAD(, NvmeRequest) wfq_inflight_list[CDL_MAX_CLASSES]; /* for SQ-delete scan */
-    uint64_t            wfq_v_clock;                            /* SCFQ virtual clock (monotone) */
-    uint64_t            wfq_f_last[CDL_MAX_CLASSES];            /* last finish tag per class */
-    QTAILQ_HEAD(, NvmeRequest) wfq_queues[CDL_MAX_CLASSES];     /* per-class ingestion FIFOs */
+    /* Duration-weighted class scheduling with per-class SQ round robin. */
+    uint32_t            wfq_depth;
+    uint32_t            cdl_pending;
+    uint32_t            wfq_inflight;
+    uint32_t            *cdl_inflight_by_class;
+    uint16_t            *cdl_dispatch_wait;
+    uint64_t            wfq_v_clock;
+    uint64_t            *wfq_f_last;
+    uint16_t            *cdl_rr_next;
+    bool                *cdl_rr_started;
+    QTAILQ_HEAD(, NvmeRequest) wfq_inflight_list;
+
+    /* Only writable through x-cdl-test, which exists in qtest processes. */
+    int64_t             cdl_test_clock_offset_ns;
+    uint64_t            cdl_test_delay_ns[CDL_TEST_DELAY_MAX];
+    int64_t             cdl_test_stop_delta_ns;
+    bool                cdl_test_stop_delta_valid;
+    uint16_t            cdl_test_execution_status;
+    bool                cdl_test_execution_status_valid;
+    bool                cdl_test_hold_dispatch;
+    uint32_t            cdl_test_block_poller;
+    uint32_t            cdl_test_hold_completion_poller;
+    NvmeCdlTestFault    cdl_test_fault;
+    bool                cdl_test_crash;
+    NvmeCdlTestBarrier  cdl_test_barrier;
+    NvmeCdlTestBarrier  cdl_test_barrier_reached;
+    NvmeCdlTestBarrier  cdl_test_cut_stage;
+    uint32_t           cdl_test_log_xor_offset[2];
+    uint8_t            cdl_test_log_xor_value[2];
+    uint64_t            *cdl_test_dispatches;
+    uint64_t            cdl_test_dispatch_total;
+    uint64_t            cdl_test_dispatch_limit;
+    NvmeCdlTestDispatch *cdl_test_dispatch_log;
+    uint32_t            cdl_test_dispatch_log_count;
 
     volatile int64_t chip_next_avail_time[FEMU_MAX_NUM_CHIPS];
     pthread_spinlock_t chip_locks[FEMU_MAX_NUM_CHIPS];
@@ -2411,6 +2517,9 @@ typedef struct FemuCtrl {
     uint32_t        irq_status;
     /* per poller: completions waiting for space in their completion queue */
     union cq_req_list *cpl_backlog;
+    /* per poller: requests retained when the backend destination ring is full */
+    union cq_req_list *ftl_backlog;
+    uint32_t        *ftl_backlog_count;
     bool            poller_on;
 
     FemuPollerCtr   *poller_ctr;   /* per-poller I/O accounting (1-based) */
@@ -2674,7 +2783,7 @@ void nvme_resume_pollers(FemuCtrl *n, bool was_started);
 void nvme_update_sq_tail(NvmeSQueue *sq);
 uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
                       sqid, uint16_t cqid, uint16_t size, enum NvmeQueueFlags
-                      prio, int contig);
+                      prio, int contig, uint8_t cdl_class);
 void nvme_drain_sq(FemuCtrl *n, NvmeSQueue *sq);
 void nvme_retire_ns_requests(FemuCtrl *n, NvmeNamespace *ns);
 void nvme_free_sq(NvmeSQueue *sq, FemuCtrl *n);
@@ -2728,6 +2837,8 @@ void     nvme_addr_write(FemuCtrl *n, hwaddr addr, void *buf, int size);
  */
 static inline void nvme_req_release_ranges(NvmeRequest *req)
 {
+    g_clear_pointer(&req->write_data, g_free);
+    g_clear_pointer(&req->meta_buf, g_free);
     g_free(req->dsm_ranges);
     req->dsm_ranges = NULL;
     req->dsm_nr_ranges = 0;
@@ -2929,10 +3040,29 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, uint64_t len)
     do { printf("[FEMU] Log: " fmt, ## __VA_ARGS__); } while (0)
 
 
-/* TP4221 WFQ scheduler API — declared after both NvmeRequest and FemuCtrl */
+/* TP4221 CDL v2 implementation API. */
+bool cdl_init(FemuCtrl *n, Error **errp);
+void cdl_exit(FemuCtrl *n);
+void cdl_reset(FemuCtrl *n);
+bool cdl_save_state(FemuCtrl *n, Error **errp);
+bool cdl_account(FemuCtrl *n, NvmeRequest *req);
+uint16_t nvme_cdl_execute(FemuCtrl *n, NvmeRequest *req);
+int64_t nvme_io_clock(FemuCtrl *n);
+void nvme_apply_service_delay(FemuCtrl *n, NvmeRequest *req);
+int64_t cdl_clock_now_ns(FemuCtrl *n);
+void cdl_test_advance(FemuCtrl *n, NvmeCdlTestDelay stage);
+bool cdl_test_barrier_wait(FemuCtrl *n, NvmeCdlTestBarrier stage);
+bool cdl_test_take_execution_status(FemuCtrl *n, uint16_t *status);
+void cdl_test_command(FemuCtrl *n, const char *value, Error **errp);
+char *cdl_test_state(FemuCtrl *n);
+void cdl_dispatch(FemuCtrl *n);
+bool cdl_sq_reserve(FemuCtrl *n, uint8_t cls);
+void cdl_sq_unreserve(FemuCtrl *n, uint8_t cls);
+void cdl_sq_created(FemuCtrl *n, NvmeSQueue *sq);
+void cdl_sq_deleted(FemuCtrl *n, NvmeSQueue *sq);
+void nvme_enqueue_or_backlog(FemuCtrl *n, NvmeRequest *req, int poller);
 void wfq_init(FemuCtrl *n);
-void wfq_recompute_limits(FemuCtrl *n);
 void wfq_defer(FemuCtrl *n, NvmeRequest *req, int poller);
-void wfq_on_complete(FemuCtrl *n, NvmeRequest *req);
+bool wfq_on_complete(FemuCtrl *n, NvmeRequest *req);
 
 #endif /* __FEMU_NVME_H */

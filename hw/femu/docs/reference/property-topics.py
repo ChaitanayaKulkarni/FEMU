@@ -15,7 +15,7 @@ DEVICES = [
         "type": "femu",
         "title": "NVMe controller",
         "parent": "pci-device",
-        "test_only": ["x-ftl-check", "x-ns-test", "x-oc12-clock",
+        "test_only": ["x-cdl-test", "x-cdl-test-state", "x-ftl-check", "x-ns-test", "x-oc12-clock",
                       "x-stream-test"],
         "topics": [
             {
@@ -34,6 +34,14 @@ DEVICES = [
                     "queues", "entries", "max_sqes", "max_cqes", "stride",
                     "multipoller_enabled", "poller_ratio", "hiops_inline",
                     "aerl", "elpe", "mdts", "intc", "intc_thresh", "intc_time",
+                ],
+            },
+            {
+                "title": "TP4221 CDL experimental profile",
+                "kind": "static",
+                "props": [
+                    "cdl", "cdl_classes", "cdl_max_sqs", "cdl_sqs_per_class",
+                    "cdl_bound_classes", "cdl_file", "wfq_depth",
                 ],
             },
             {

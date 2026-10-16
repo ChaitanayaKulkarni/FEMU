@@ -105,6 +105,28 @@ static const FemuPropDesc femu_ctrl_descs[] = {
     { "entries",
       "Value reported as CAP.MQES (0's based), 1 to 65534; the controller "
       "accepts queues of up to entries + 1 entries" },
+    { "cdl",
+      "Enable the Identify 2.1 / log 2.0 TP4221 CDL experimental FEMU profile; requires "
+      "PCI vid=0x8086, did=0x5845, ONCS Save/Select support and cdl_file; "
+      "OpenChannel mode is unsupported" },
+    { "cdl_classes",
+      "Number of CDL class identifiers including bypass class 0, from 1 to "
+      "256; IDs are 0 through cdl_classes - 1" },
+    { "cdl_max_sqs",
+      "Aggregate nonzero-class SQ capacity; explicit with cdl=on and N>1, "
+      "at most queues; zero for bypass-only N=1" },
+    { "cdl_sqs_per_class",
+      "Uniform SQ limit for each nonzero class; explicit with N>1, positive "
+      "and at most cdl_max_sqs; zero for N=1" },
+    { "cdl_bound_classes",
+      "Distinct bound nonzero-class limit; explicit with N>1, positive "
+      "and less than cdl_classes; zero for N=1" },
+    { "cdl_file",
+      "Controller-specific durable CDL configuration, counter and replay "
+      "store; required with cdl=on and never shared between controllers" },
+    { "wfq_depth",
+      "Global maximum number of dispatched timed CDL commands, from 1 to the "
+      "controller request limit" },
     { "max_sqes",
       "Submission queue entry size as a power of two (Identify SQES); "
       "must be 6, 64-byte entries" },

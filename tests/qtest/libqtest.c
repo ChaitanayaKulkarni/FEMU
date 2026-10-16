@@ -17,9 +17,11 @@
 #include "qemu/osdep.h"
 
 #ifndef _WIN32
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/un.h>
+#include <termios.h>
 #endif /* _WIN32 */
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -113,6 +115,32 @@ static int init_socket(const char *socket_path)
     qemu_set_cloexec(sock);
     return sock;
 }
+
+#ifndef _WIN32
+static int init_pty(char **slave_path, int *slave_fd)
+{
+    struct termios tio;
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+
+    g_assert_cmpint(master, !=, -1);
+    g_assert_cmpint(grantpt(master), ==, 0);
+    g_assert_cmpint(unlockpt(master), ==, 0);
+    *slave_path = g_strdup(ptsname(master));
+    g_assert_nonnull(*slave_path);
+    *slave_fd = open(*slave_path, O_RDWR | O_NOCTTY);
+    g_assert_cmpint(*slave_fd, !=, -1);
+
+    g_assert_cmpint(tcgetattr(master, &tio), ==, 0);
+    cfmakeraw(&tio);
+    g_assert_cmpint(tcsetattr(master, TCSANOW, &tio), ==, 0);
+    g_assert_cmpint(tcgetattr(*slave_fd, &tio), ==, 0);
+    cfmakeraw(&tio);
+    g_assert_cmpint(tcsetattr(*slave_fd, TCSANOW, &tio), ==, 0);
+    qemu_set_cloexec(master);
+    qemu_set_cloexec(*slave_fd);
+    return master;
+}
+#endif
 
 static int socket_accept(int sock)
 {
@@ -474,6 +502,17 @@ static QTestState *qtest_init_internal(const char *qemu_bin,
     int sock, qmpsock, i;
     g_autofree gchar *socket_path = qtest_socket_path("sock");
     g_autofree gchar *qmp_socket_path = qtest_socket_path("qmp");
+    g_autofree char *log_path = NULL;
+    g_autofree char *log_arg = NULL;
+    const char *log_dir = g_getenv("QTEST_LOG_DIR");
+    static unsigned log_sequence;
+
+    if (log_dir) {
+        log_path = g_strdup_printf("%s/qtest-%d-%u.log", log_dir,
+                                   getpid(), log_sequence++);
+    }
+    log_arg = g_shell_quote(log_path ?: (getenv("QTEST_LOG") ?
+                                        DEV_STDERR : DEV_NULL));
 
     /*
      * It's possible that if an earlier test run crashed it might
@@ -484,23 +523,56 @@ static QTestState *qtest_init_internal(const char *qemu_bin,
     unlink(socket_path);
     unlink(qmp_socket_path);
 
-    socket_init();
-    sock = init_socket(socket_path);
-    qmpsock = init_socket(qmp_socket_path);
+#ifndef _WIN32
+    if (getenv("QTEST_USE_PTY")) {
+        g_autofree char *qtest_pty = NULL;
+        g_autofree char *qmp_pty = NULL;
+        int qtest_slave, qmp_slave;
 
-    s = qtest_spawn_qemu(qemu_bin,
-                         "-qtest unix:%s "
-                         "-qtest-log %s "
-                         "-chardev socket,path=%s,id=char0 "
-                         "-mon chardev=char0,mode=control "
-                         "-display none "
-                         "-audio none "
-                         "%s"
-                         " -accel qtest",
-                         socket_path,
-                         getenv("QTEST_LOG") ? DEV_STDERR : DEV_NULL,
-                         qmp_socket_path,
-                         extra_args ?: "");
+        sock = init_pty(&qtest_pty, &qtest_slave);
+        qmpsock = init_pty(&qmp_pty, &qmp_slave);
+        s = qtest_spawn_qemu(qemu_bin,
+                             "-qtest %s "
+                             "-qtest-log %s "
+                             "-chardev serial,path=%s,id=char0 "
+                             "-mon chardev=char0,mode=control "
+                             "-display none "
+                             "-audio none "
+                             "%s"
+                             " -accel qtest",
+                             qtest_pty,
+                             log_arg,
+                             qmp_pty,
+                             extra_args ?: "");
+        s->fd = sock;
+        s->qmp_fd = qmpsock;
+        s->sock = qtest_slave;
+        s->qmpsock = qmp_slave;
+    } else
+#endif
+    {
+        socket_init();
+        sock = init_socket(socket_path);
+        qmpsock = init_socket(qmp_socket_path);
+
+        s = qtest_spawn_qemu(qemu_bin,
+                             "-qtest unix:%s "
+                             "-qtest-log %s "
+                             "-chardev socket,path=%s,id=char0 "
+                             "-mon chardev=char0,mode=control "
+                             "-display none "
+                             "-audio none "
+                             "%s"
+                             " -accel qtest",
+                             socket_path,
+                             log_arg,
+                             qmp_socket_path,
+                             extra_args ?: "");
+        s->fd = -1;
+        s->qmp_fd = -1;
+        s->sock = sock;
+        s->qmpsock = qmpsock;
+    }
 
     qtest_client_set_rx_handler(s, qtest_client_socket_recv_line);
     qtest_client_set_tx_handler(s, qtest_client_socket_send);
@@ -510,10 +582,6 @@ static QTestState *qtest_init_internal(const char *qemu_bin,
         s->irq_level[i] = false;
     }
 
-    s->fd = -1;
-    s->qmp_fd = -1;
-    s->sock = sock;
-    s->qmpsock = qmpsock;
     if (do_connect) {
         qtest_connect(s);
     }
@@ -540,6 +608,10 @@ void qtest_connect(QTestState *s)
     g_autofree gchar *socket_path = qtest_socket_path("sock");
     g_autofree gchar *qmp_socket_path = qtest_socket_path("qmp");
 
+    if (s->fd >= 0 && s->qmp_fd >= 0) {
+        s->big_endian = qtest_query_target_endianness(s);
+        return;
+    }
     g_assert(s->sock >= 0 && s->qmpsock >= 0);
     s->fd = socket_accept(s->sock);
     if (s->fd >= 0) {
@@ -653,6 +725,12 @@ void qtest_quit(QTestState *s)
     qtest_kill_qemu(s);
     close(s->fd);
     close(s->qmp_fd);
+    if (s->sock >= 0) {
+        close(s->sock);
+    }
+    if (s->qmpsock >= 0) {
+        close(s->qmpsock);
+    }
     g_string_free(s->rx, true);
 
     for (GList *it = s->pending_events; it != NULL; it = it->next) {
@@ -666,7 +744,7 @@ void qtest_quit(QTestState *s)
 
 static void socket_send(int fd, const char *buf, size_t size)
 {
-    ssize_t res = qemu_send_full(fd, buf, size);
+    ssize_t res = qemu_write_full(fd, buf, size);
 
     assert(res == size);
 }
@@ -693,12 +771,33 @@ static GString *qtest_client_socket_recv_line(QTestState *s)
     GString *line;
     size_t offset;
     char *eol;
+    gint64 deadline = g_get_monotonic_time() + 30 * G_USEC_PER_SEC;
 
     while ((eol = strchr(s->rx->str, '\n')) == NULL) {
         ssize_t len;
         char buffer[1024];
 
-        len = recv(s->fd, buffer, sizeof(buffer), 0);
+#ifndef _WIN32
+        if (getenv("QTEST_USE_PTY")) {
+            struct pollfd pfd = { .fd = s->fd, .events = POLLIN };
+            int ready = poll(&pfd, 1, 100);
+
+            if (ready < 0 && errno == EINTR) {
+                continue;
+            }
+            g_assert_cmpint(ready, >=, 0);
+            if (!ready) {
+                if (!qtest_probe_child(s)) {
+                    g_error("QEMU exited while waiting for a qtest PTY reply");
+                }
+                if (g_get_monotonic_time() > deadline) {
+                    g_error("Timed out waiting for a qtest PTY reply");
+                }
+                continue;
+            }
+        }
+#endif
+        len = read(s->fd, buffer, sizeof(buffer));
         if (len == -1 && errno == EINTR) {
             continue;
         }
