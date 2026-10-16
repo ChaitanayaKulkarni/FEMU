@@ -395,6 +395,7 @@ static void nvme_init_poller(FemuCtrl *n)
     n->cpl_backlog = g_new0(union cq_req_list, n->nr_pollers + 1);
     n->ftl_backlog = g_new0(union cq_req_list, n->nr_pollers + 1);
     n->ftl_backlog_count = g_new0(uint32_t, n->nr_pollers + 1);
+    qatomic_set(&n->ftl_backlogs_nonempty, 0);
     for (i = 1; i <= n->nr_pollers; i++) {
         QTAILQ_INIT(&n->cpl_backlog[i]);
         QTAILQ_INIT(&n->ftl_backlog[i]);

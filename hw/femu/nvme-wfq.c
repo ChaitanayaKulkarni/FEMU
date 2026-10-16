@@ -9,6 +9,15 @@
 #define CDL_STORE_HEADER_BYTES 96
 #define CDL_STORE_ENTRY_BYTES  32
 #define CDL_STORE_VERSION      3
+
+/* Scratch is protected by cdl_lock and valid only during one dispatch call.
+ * No candidate pointer survives unlock, SQ deletion, or request recycling.
+ */
+typedef struct NvmeCdlCandidate {
+    NvmeRequest *req;
+    uint64_t finish;
+} NvmeCdlCandidate;
+
 static bool cdl_bytes_zero(const uint8_t *buf, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
@@ -226,6 +235,8 @@ void cdl_test_command(FemuCtrl *n, const char *value, Error **errp)
         memset(n->cdl_test_dispatches, 0,
                n->cdl_num_classes * sizeof(*n->cdl_test_dispatches));
         n->cdl_test_dispatch_total = 0;
+        n->cdl_test_dispatch_failures = 0;
+        n->cdl_test_dispatch_failures_max = 0;
         n->cdl_test_dispatch_limit = 0;
         n->cdl_test_dispatch_log_count = 0;
         pthread_spin_unlock(&n->cdl_lock);
@@ -454,11 +465,15 @@ char *cdl_test_state(FemuCtrl *n)
     pthread_spin_lock(&n->cdl_lock);
     g_string_append_printf(out,
                            "pending=%u;inflight=%u;hold=%u;blocked=%u;total=%" PRIu64
-                           ";limit=%" PRIu64 ";barrier=%u;reached=%u;counts=",
+                           ";failed=%" PRIu64 ";failed-max=%" PRIu64
+                           ";limit=%" PRIu64
+                           ";barrier=%u;reached=%u;counts=",
                            n->cdl_pending, n->wfq_inflight,
                            n->cdl_test_hold_dispatch,
                            n->cdl_test_block_poller,
                            n->cdl_test_dispatch_total,
+                           n->cdl_test_dispatch_failures,
+                           n->cdl_test_dispatch_failures_max,
                            n->cdl_test_dispatch_limit,
                            qatomic_read(&n->cdl_test_barrier),
                            qatomic_read(&n->cdl_test_barrier_reached));
@@ -840,7 +855,27 @@ bool cdl_init(FemuCtrl *n, Error **errp)
     n->cdl_saved_desc_present = g_new0(bool, n->cdl_num_classes);
     n->cdl_assoc = g_new0(uint32_t, n->cdl_num_classes);
     n->cdl_inflight_by_class = g_new0(uint32_t, n->cdl_num_classes);
-    n->cdl_members = g_new0(union cdl_sq_list, n->cdl_num_classes);
+    n->cdl_members = g_new0(CdlBitmap, n->cdl_num_classes);
+    n->cdl_ready_sqs = g_new0(CdlBitmap, n->cdl_num_classes);
+    size_t sq_words = DIV_ROUND_UP(n->nr_io_queues + 1, 64);
+    size_t class_words = DIV_ROUND_UP(n->cdl_num_classes, 64);
+
+    n->cdl_bitmap_word_count = 2 * n->cdl_num_classes * sq_words +
+                               class_words;
+    n->cdl_bitmap_words = g_new0(uint64_t, n->cdl_bitmap_word_count);
+    for (uint32_t c = 0; c < n->cdl_num_classes; c++) {
+        n->cdl_members[c].words = n->cdl_bitmap_words + c * sq_words;
+        n->cdl_members[c].nbits = n->nr_io_queues + 1;
+        n->cdl_ready_sqs[c].words = n->cdl_bitmap_words +
+                                   (n->cdl_num_classes + c) * sq_words;
+        n->cdl_ready_sqs[c].nbits = n->nr_io_queues + 1;
+    }
+    n->cdl_ready_classes.words = n->cdl_bitmap_words +
+                                 2 * n->cdl_num_classes * sq_words;
+    n->cdl_ready_classes.nbits = n->cdl_num_classes;
+    /* nr_pollers is established later and never exceeds nr_io_queues. */
+    n->cdl_blocked = g_new0(bool, n->nr_io_queues + 1);
+    n->cdl_candidates = g_new0(NvmeCdlCandidate, n->cdl_num_classes);
     n->cdl_dispatch_wait = g_new0(uint16_t, n->cdl_num_classes);
     n->wfq_f_last = g_new0(uint64_t, n->cdl_num_classes);
     n->cdl_rr_next = g_new0(uint16_t, n->cdl_num_classes);
@@ -904,6 +939,10 @@ void cdl_exit(FemuCtrl *n)
     g_clear_pointer(&n->cdl_assoc, g_free);
     g_clear_pointer(&n->cdl_inflight_by_class, g_free);
     g_clear_pointer(&n->cdl_members, g_free);
+    g_clear_pointer(&n->cdl_ready_sqs, g_free);
+    g_clear_pointer(&n->cdl_bitmap_words, g_free);
+    g_clear_pointer(&n->cdl_blocked, g_free);
+    g_clear_pointer(&n->cdl_candidates, g_free);
     g_clear_pointer(&n->cdl_dispatch_wait, g_free);
     g_clear_pointer(&n->wfq_f_last, g_free);
     g_clear_pointer(&n->cdl_rr_next, g_free);
@@ -968,47 +1007,53 @@ static uint64_t cdl_cost_ns(NvmeRequest *req)
 static NvmeRequest *cdl_class_candidate(FemuCtrl *n, uint8_t cls,
                                         const bool *blocked)
 {
-    uint16_t start = n->cdl_rr_next[cls];
-    NvmeSQueue *sq;
+    CdlBitmap *ready = &n->cdl_ready_sqs[cls];
+    unsigned int first = cdl_bitmap_next(ready, n->cdl_rr_next[cls]);
+    unsigned int qid = first;
 
-    /* Membership is sorted by SQID; preserve ascending, wrapping RR order.
-     * Empty classes cost O(1), and a class visits only its own bound SQs.
-     * The caller holds cdl_lock, including across queue publication/removal.
-     */
-    for (unsigned int pass = 0; pass < 2; pass++) {
-        QTAILQ_FOREACH(sq, &n->cdl_members[cls], cdl_member_entry) {
-            NvmeRequest *req;
-
-            if ((pass == 0 ? sq->sqid < start : sq->sqid >= start) ||
-                !sq->is_active || QTAILQ_EMPTY(&sq->cdl_pending)) {
-                continue;
-            }
-            req = QTAILQ_FIRST(&sq->cdl_pending);
-            if (!blocked || !blocked[req->wfq_poller_idx]) {
-                return req;
-            }
-        }
+    if (!qid) {
+        return NULL;
     }
+    /* Only pending SQs are visited. Backpressure can require skipping ready
+     * SQs, but neither inactive classes nor empty SQs add a search cost.
+     */
+    do {
+        NvmeSQueue *sq = n->sq[qid];
+        NvmeRequest *req;
+
+        /* Membership is published only after n->sq[qid], and is removed
+         * before that pointer is cleared. Queue lifecycle code must preserve
+         * this ordering while bitmap lookup is enabled.
+         */
+        assert(sq);
+        req = QTAILQ_FIRST(&sq->cdl_pending);
+        assert(req);
+        if (sq->is_active && (!blocked || !blocked[req->wfq_poller_idx])) {
+            return req;
+        }
+        qid = cdl_bitmap_next(ready, qid + 1);
+    } while (qid != first);
     return NULL;
 }
 
 static uint16_t cdl_next_member(FemuCtrl *n, uint8_t cls, uint16_t after)
 {
-    NvmeSQueue *sq;
-    uint16_t first = 0;
+    CdlBitmap *members = &n->cdl_members[cls];
+    unsigned int first = cdl_bitmap_next(members, after + 1);
+    unsigned int qid = first;
 
-    QTAILQ_FOREACH(sq, &n->cdl_members[cls], cdl_member_entry) {
-        if (!sq->is_active) {
-            continue;
-        }
-        if (!first) {
-            first = sq->sqid;
-        }
-        if (sq->sqid > after) {
-            return sq->sqid;
-        }
+    if (!qid) {
+        return 0;
     }
-    return first;
+    do {
+        /* See the publication invariant in cdl_class_candidate(). */
+        assert(n->sq[qid]);
+        if (n->sq[qid]->is_active) {
+            return qid;
+        }
+        qid = cdl_bitmap_next(members, qid + 1);
+    } while (qid != first);
+    return 0;
 }
 
 static uint64_t cdl_finish_tag(FemuCtrl *n, uint8_t cls, NvmeRequest *req)
@@ -1022,23 +1067,54 @@ static uint64_t cdl_finish_tag(FemuCtrl *n, uint8_t cls, NvmeRequest *req)
     return n->wfq_f_last[cls] + (uint64_t)inc;
 }
 
-static void cdl_rebase_locked(FemuCtrl *n)
+static bool cdl_rebase_locked(FemuCtrl *n)
 {
     uint64_t base = n->wfq_v_clock;
 
     if (base <= UINT64_MAX / 4) {
-        return;
+        return false;
     }
     for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
         n->wfq_f_last[c] = n->wfq_f_last[c] > base ?
                             n->wfq_f_last[c] - base : 0;
     }
     n->wfq_v_clock = 0;
+    return true;
+}
+
+static void cdl_refresh_candidate(FemuCtrl *n, uint8_t cls,
+                                  const bool *blocked)
+{
+    NvmeCdlCandidate *candidate = &n->cdl_candidates[cls];
+
+    candidate->req = cdl_class_candidate(n, cls, blocked);
+    if (candidate->req) {
+        candidate->finish = cdl_finish_tag(n, cls, candidate->req);
+    }
+}
+
+static void cdl_refresh_candidates(FemuCtrl *n, const bool *blocked)
+{
+    for (unsigned int c = cdl_bitmap_find(&n->cdl_ready_classes, 1); c;
+         c = cdl_bitmap_find(&n->cdl_ready_classes, c + 1)) {
+        cdl_refresh_candidate(n, c, blocked);
+    }
+}
+
+static void cdl_sq_ready_clear(FemuCtrl *n, NvmeSQueue *sq)
+{
+    uint8_t cls = sq->cdl_class;
+
+    cdl_bitmap_clear(&n->cdl_ready_sqs[cls], sq->sqid);
+    if (!n->cdl_ready_sqs[cls].summary) {
+        cdl_bitmap_clear(&n->cdl_ready_classes, cls);
+    }
 }
 
 static void cdl_dispatch_locked(FemuCtrl *n)
 {
-    g_autofree bool *blocked = NULL;
+    bool *blocked = NULL;
+    uint64_t failed_attempts = 0;
 
     if (!qatomic_read(&n->dataplane_started) || n->cdl_store_failed ||
         qatomic_read(&n->cdl_test_barrier) == CDL_BARRIER_AFTER_ADMISSION ||
@@ -1049,12 +1125,14 @@ static void cdl_dispatch_locked(FemuCtrl *n)
         n->wfq_inflight >= n->wfq_depth) {
         return;
     }
-    blocked = g_new0(bool, n->nr_pollers + 1);
-    if (n->ftl_backlog_count) {
+    if (qatomic_read(&n->ftl_backlogs_nonempty)) {
+        blocked = n->cdl_blocked;
+        memset(blocked, 0, (n->nr_pollers + 1) * sizeof(*blocked));
         for (uint32_t p = 1; p <= n->nr_pollers; p++) {
             blocked[p] = qatomic_read(&n->ftl_backlog_count[p]) != 0;
         }
     }
+    cdl_refresh_candidates(n, blocked);
 
     while (n->wfq_inflight < n->wfq_depth) {
         NvmeRequest *best_req = NULL;
@@ -1063,16 +1141,19 @@ static void cdl_dispatch_locked(FemuCtrl *n)
         uint16_t best_wait = 0;
         bool force_progress = false;
 
-        cdl_rebase_locked(n);
+        if (cdl_rebase_locked(n)) {
+            cdl_refresh_candidates(n, blocked);
+        }
 
-        for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
-            NvmeRequest *req = cdl_class_candidate(n, c, blocked);
+        for (unsigned int c = cdl_bitmap_find(&n->cdl_ready_classes, 1); c;
+             c = cdl_bitmap_find(&n->cdl_ready_classes, c + 1)) {
+            NvmeRequest *req = n->cdl_candidates[c].req;
             uint64_t finish;
 
             if (!req) {
                 continue;
             }
-            finish = cdl_finish_tag(n, c, req);
+            finish = n->cdl_candidates[c].finish;
             if (n->cdl_dispatch_wait[c] >= 999) {
                 if (!force_progress || n->cdl_dispatch_wait[c] > best_wait ||
                     (n->cdl_dispatch_wait[c] == best_wait && c < best_class)) {
@@ -1096,26 +1177,47 @@ static void cdl_dispatch_locked(FemuCtrl *n)
 
         NvmeSQueue *sq = best_req->sq;
         QTAILQ_REMOVE(&sq->cdl_pending, best_req, wfq_entry);
-        if (n->cdl_test_block_poller == best_req->wfq_poller_idx ||
-            femu_ring_enqueue(n->to_ftl[best_req->wfq_poller_idx],
-                              (void *)&best_req, 1) != 1) {
-            QTAILQ_INSERT_HEAD(&sq->cdl_pending, best_req, wfq_entry);
-            blocked[best_req->wfq_poller_idx] = true;
-            continue;
-        }
-        assert(n->cdl_pending);
-        n->cdl_pending--;
-
+        /* Publish every request-local field before the ring can transfer
+         * ownership to the FTL. Global scheduler state is committed only after
+         * enqueue succeeds and remains protected by cdl_lock.
+         */
         best_req->wfq_virt_finish = best_finish;
         best_req->stime = best_req->expire_time =
             qemu_clock_get_ns(n->test_oc12_clock ? QEMU_CLOCK_VIRTUAL :
                                                    QEMU_CLOCK_REALTIME);
+        smp_wmb();
+        if (n->cdl_test_block_poller == best_req->wfq_poller_idx ||
+            femu_ring_enqueue(n->to_ftl[best_req->wfq_poller_idx],
+                              (void *)&best_req, 1) != 1) {
+            QTAILQ_INSERT_HEAD(&sq->cdl_pending, best_req, wfq_entry);
+            qatomic_set(&n->cdl_dispatch_kick, 1);
+            if (qtest_enabled()) {
+                n->cdl_test_dispatch_failures++;
+                failed_attempts++;
+            }
+            if (!blocked) {
+                blocked = n->cdl_blocked;
+                memset(blocked, 0,
+                       (n->nr_pollers + 1) * sizeof(*blocked));
+            }
+            blocked[best_req->wfq_poller_idx] = true;
+            /* This destination can also own another class's cached head. */
+            cdl_refresh_candidates(n, blocked);
+            continue;
+        }
+        assert(n->cdl_pending);
+        n->cdl_pending--;
+        if (QTAILQ_EMPTY(&sq->cdl_pending)) {
+            cdl_sq_ready_clear(n, sq);
+        }
+
         n->wfq_f_last[best_class] = best_finish;
         n->cdl_rr_started[best_class] = true;
         n->cdl_rr_next[best_class] =
             cdl_next_member(n, best_class, sq->sqid);
         n->wfq_inflight++;
         n->cdl_inflight_by_class[best_class]++;
+        cdl_refresh_candidate(n, best_class, blocked);
         if (qtest_enabled()) {
             n->cdl_test_dispatches[best_class]++;
             n->cdl_test_dispatch_total++;
@@ -1131,15 +1233,18 @@ static void cdl_dispatch_locked(FemuCtrl *n)
         }
         QTAILQ_INSERT_TAIL(&n->wfq_inflight_list, best_req,
                            wfq_inflight_entry);
-        trace_femu_cdl_dispatch(n->cdl_trace_id, best_req->cdl_attempt,
-                               sq->sqid,
-                                le16_to_cpu(best_req->cmd.cid), best_class,
-                                best_req->wfq_poller_idx,
-                                cdl_clock_now_ns(n));
+        if (trace_event_get_state_backends(TRACE_FEMU_CDL_DISPATCH)) {
+            trace_femu_cdl_dispatch(n->cdl_trace_id,
+                                    best_req->cdl_attempt, sq->sqid,
+                                    le16_to_cpu(best_req->cmd.cid),
+                                    best_class, best_req->wfq_poller_idx,
+                                    cdl_clock_now_ns(n));
+        }
 
         n->wfq_v_clock = best_finish;
-        for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
-            if (cdl_class_candidate(n, c, blocked)) {
+        for (unsigned int c = cdl_bitmap_find(&n->cdl_ready_classes, 1); c;
+             c = cdl_bitmap_find(&n->cdl_ready_classes, c + 1)) {
+            if (n->cdl_candidates[c].req) {
                 n->wfq_v_clock = MIN(n->wfq_v_clock, n->wfq_f_last[c]);
                 if (c == best_class) {
                     n->cdl_dispatch_wait[c] = 0;
@@ -1153,6 +1258,10 @@ static void cdl_dispatch_locked(FemuCtrl *n)
             n->cdl_test_hold_dispatch = true;
             break;
         }
+    }
+    if (qtest_enabled()) {
+        n->cdl_test_dispatch_failures_max = MAX(
+            n->cdl_test_dispatch_failures_max, failed_attempts);
     }
 }
 
@@ -1207,23 +1316,13 @@ void cdl_sq_unreserve(FemuCtrl *n, uint8_t cls)
 void cdl_sq_created(FemuCtrl *n, NvmeSQueue *sq)
 {
     uint8_t cls = sq->cdl_class;
-    NvmeSQueue *member;
 
     if (!n->cdl_profile || !cls) {
         return;
     }
     pthread_spin_lock(&n->cdl_lock);
     assert(sq->cdl_quota_reserved && n->cdl_assoc[cls]);
-    QTAILQ_FOREACH(member, &n->cdl_members[cls], cdl_member_entry) {
-        if (member->sqid > sq->sqid) {
-            break;
-        }
-    }
-    if (member) {
-        QTAILQ_INSERT_BEFORE(member, sq, cdl_member_entry);
-    } else {
-        QTAILQ_INSERT_TAIL(&n->cdl_members[cls], sq, cdl_member_entry);
-    }
+    cdl_bitmap_set(&n->cdl_members[cls], sq->sqid);
     if (!n->cdl_rr_next[cls] ||
         (!n->cdl_rr_started[cls] && sq->sqid < n->cdl_rr_next[cls])) {
         n->cdl_rr_next[cls] = sq->sqid;
@@ -1259,7 +1358,8 @@ void cdl_sq_deleted(FemuCtrl *n, NvmeSQueue *sq)
     assert(sq->cdl_quota_reserved);
     cdl_sq_unreserve_locked(n, cls);
     sq->cdl_quota_reserved = false;
-    QTAILQ_REMOVE(&n->cdl_members[cls], sq, cdl_member_entry);
+    cdl_sq_ready_clear(n, sq);
+    cdl_bitmap_clear(&n->cdl_members[cls], sq->sqid);
     if (!n->cdl_assoc[cls]) {
         n->cdl_rr_started[cls] = false;
     }
@@ -1275,6 +1375,7 @@ void wfq_defer(FemuCtrl *n, NvmeRequest *req, int poller)
 {
     uint8_t cls = req->sq->cdl_class;
     int64_t admission;
+    bool dispatch_deferred;
 
     if (!cdl_test_barrier_wait(n, CDL_BARRIER_BEFORE_ADMISSION)) {
         nvme_req_release_ranges(req);
@@ -1316,14 +1417,21 @@ void wfq_defer(FemuCtrl *n, NvmeRequest *req, int poller)
     req->cdl_checked = false;
     req->cdl_cq_delay_applied = false;
     req->wfq_orphaned = false;
+    if (QTAILQ_EMPTY(&req->sq->cdl_pending)) {
+        cdl_bitmap_set(&n->cdl_ready_sqs[cls], req->sq->sqid);
+        cdl_bitmap_set(&n->cdl_ready_classes, cls);
+    }
     QTAILQ_INSERT_TAIL(&req->sq->cdl_pending, req, wfq_entry);
     n->cdl_pending++;
     cdl_test_advance(n, CDL_TEST_DELAY_QUEUE);
-    if (qatomic_read(&n->cdl_test_barrier) != CDL_BARRIER_AFTER_ADMISSION) {
+    dispatch_deferred = qatomic_read(&n->cdl_test_barrier) ==
+                        CDL_BARRIER_AFTER_ADMISSION;
+    if (!dispatch_deferred) {
         cdl_dispatch_locked(n);
     }
     pthread_spin_unlock(&n->cdl_lock);
-    if (cdl_test_barrier_wait(n, CDL_BARRIER_AFTER_ADMISSION)) {
+    if (cdl_test_barrier_wait(n, CDL_BARRIER_AFTER_ADMISSION) &&
+        dispatch_deferred) {
         cdl_dispatch(n);
     }
 }
@@ -1429,13 +1537,20 @@ void wfq_init(FemuCtrl *n)
     QTAILQ_INIT(&n->wfq_inflight_list);
     n->cdl_pending = 0;
     n->wfq_inflight = 0;
+    qatomic_set(&n->cdl_dispatch_kick, 0);
     n->wfq_v_clock = 0;
     if (!n->cdl_profile) {
         return;
     }
     for (uint32_t c = 0; c < n->cdl_num_classes; c++) {
-        QTAILQ_INIT(&n->cdl_members[c]);
+        n->cdl_members[c].summary = 0;
+        n->cdl_ready_sqs[c].summary = 0;
     }
+    n->cdl_ready_classes.summary = 0;
+    memset(n->cdl_bitmap_words, 0,
+           n->cdl_bitmap_word_count * sizeof(*n->cdl_bitmap_words));
+    memset(n->cdl_candidates, 0,
+           n->cdl_num_classes * sizeof(*n->cdl_candidates));
     memset(n->cdl_inflight_by_class, 0,
            n->cdl_num_classes * sizeof(*n->cdl_inflight_by_class));
     memset(n->cdl_dispatch_wait, 0,

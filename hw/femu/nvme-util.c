@@ -154,6 +154,10 @@ static void nvme_resume_controller(FemuCtrl *n, bool was_started)
 
     smp_mb();   /* land every change before a poller can observe the flag */
     n->dataplane_started = true;
+    /* A paused queue deletion can leave schedulable work pending. The old
+     * unconditional per-SQ sweep call supplied this recovery implicitly.
+     */
+    cdl_dispatch(n);
 }
 
 /* Under BQL, a nested pause must not resume its caller's work. */
@@ -548,6 +552,8 @@ void nvme_drain_sq(FemuCtrl *n, NvmeSQueue *sq)
                 qatomic_dec(&n->ftl_pending_count);
             }
         }
+        /* The removed SQ may have owned the cached earliest deadline. */
+        n->ftl_pending_next_ns = 0;
     }
 
     for (p = 1; p <= (int)n->nr_pollers; p++) {
@@ -597,9 +603,7 @@ void nvme_drain_sq(FemuCtrl *n, NvmeSQueue *sq)
             QTAILQ_FOREACH_SAFE(req, &n->ftl_backlog[p], entry, next) {
                 if (req->sq == sq) {
                     QTAILQ_REMOVE(&n->ftl_backlog[p], req, entry);
-                    assert(qatomic_read(&n->ftl_backlog_count[p]));
-                    qatomic_set(&n->ftl_backlog_count[p],
-                                qatomic_read(&n->ftl_backlog_count[p]) - 1);
+                    nvme_ftl_backlog_dec(n, p);
                 }
             }
         }
@@ -674,6 +678,8 @@ void nvme_retire_ns_requests(FemuCtrl *n, NvmeNamespace *ns)
                               req->expire_time <= nvme_io_clock(n));
         QTAILQ_INSERT_TAIL(&n->cpl_backlog[poller], req, entry);
     }
+    /* Namespace retirement may have removed the cached earliest deadline. */
+    n->ftl_pending_next_ns = 0;
     for (p = 1; p <= n->nr_pollers; p++) {
         struct rte_ring *rings[2];
         int r;

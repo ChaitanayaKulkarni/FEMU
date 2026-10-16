@@ -21,6 +21,7 @@
 #include "inc/pqueue.h"
 #include "nand/nand.h"
 #include "timing-model/timing.h"
+#include "cdl-bitmap.h"
 
 typedef struct FemuCtrl FemuCtrl;
 typedef struct NvmeNamespace NvmeNamespace;
@@ -1844,7 +1845,6 @@ typedef struct NvmeSQueue {
     /* TP4221 CDL: immutable Create I/O SQ class binding. */
     uint8_t     cdl_class;
     bool        cdl_quota_reserved;
-    QTAILQ_ENTRY(NvmeSQueue) cdl_member_entry;
     QTAILQ_HEAD(, NvmeRequest) cdl_pending;
 } NvmeSQueue;
 
@@ -2223,6 +2223,7 @@ typedef struct FemuCtrl {
     /* Executed timed requests waiting for modeled media completion/accounting. */
     QTAILQ_HEAD(, NvmeRequest) ftl_pending;
     uint32_t        ftl_pending_count;
+    int64_t         ftl_pending_next_ns;
     /*
      * Fixed at realize from the namespace modes, not the controller mode,
      * since namespaces may run different modes: completions then arrive
@@ -2444,8 +2445,15 @@ typedef struct FemuCtrl {
     uint32_t            wfq_depth;
     uint32_t            cdl_pending;
     uint32_t            wfq_inflight;
+    uint32_t            cdl_dispatch_kick;
     uint32_t            *cdl_inflight_by_class;
-    QTAILQ_HEAD(cdl_sq_list, NvmeSQueue) *cdl_members;
+    CdlBitmap           *cdl_members;
+    CdlBitmap           *cdl_ready_sqs;
+    CdlBitmap           cdl_ready_classes;
+    uint64_t            *cdl_bitmap_words;
+    size_t              cdl_bitmap_word_count;
+    bool                *cdl_blocked;
+    struct NvmeCdlCandidate *cdl_candidates;
     uint16_t            *cdl_dispatch_wait;
     uint64_t            wfq_v_clock;
     uint64_t            *wfq_f_last;
@@ -2472,6 +2480,8 @@ typedef struct FemuCtrl {
     uint8_t            cdl_test_log_xor_value[2];
     uint64_t            *cdl_test_dispatches;
     uint64_t            cdl_test_dispatch_total;
+    uint64_t            cdl_test_dispatch_failures;
+    uint64_t            cdl_test_dispatch_failures_max;
     uint64_t            cdl_test_dispatch_limit;
     NvmeCdlTestDispatch *cdl_test_dispatch_log;
     uint32_t            cdl_test_dispatch_log_count;
@@ -2509,6 +2519,7 @@ typedef struct FemuCtrl {
     /* per poller: requests retained when the backend destination ring is full */
     union cq_req_list *ftl_backlog;
     uint32_t        *ftl_backlog_count;
+    uint32_t        ftl_backlogs_nonempty;
     bool            poller_on;
 
     FemuPollerCtr   *poller_ctr;   /* per-poller I/O accounting (1-based) */
@@ -3049,6 +3060,8 @@ bool cdl_sq_reserve(FemuCtrl *n, uint8_t cls);
 void cdl_sq_unreserve(FemuCtrl *n, uint8_t cls);
 void cdl_sq_created(FemuCtrl *n, NvmeSQueue *sq);
 void cdl_sq_deleted(FemuCtrl *n, NvmeSQueue *sq);
+void nvme_ftl_backlog_inc(FemuCtrl *n, int poller);
+void nvme_ftl_backlog_dec(FemuCtrl *n, int poller);
 void nvme_enqueue_or_backlog(FemuCtrl *n, NvmeRequest *req, int poller);
 void wfq_init(FemuCtrl *n);
 void wfq_defer(FemuCtrl *n, NvmeRequest *req, int poller);

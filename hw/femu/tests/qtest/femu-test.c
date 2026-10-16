@@ -20354,6 +20354,185 @@ static void femu_test_cdl_cursor_membership(void *obj, void *data,
     guest_free(alloc, buf);
 }
 
+/* Sparse high IDs and class 255 must preserve FIFO/RR across leaf boundaries. */
+static void femu_test_cdl_bitmap_boundaries(void *obj, void *data,
+                                           QGuestAllocator *alloc)
+{
+    const char *id = "cdl-bitmap";
+    static const uint16_t ids[] = { 63, 64, 65, 127, 128, 2047 };
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    FemuQueue queues[ARRAY_SIZE(ids)], other;
+    uint64_t buf;
+    uint32_t result;
+    uint16_t got;
+
+    femu_enable(&c, &femu->dev, alloc);
+    buf = guest_alloc(alloc, FEMU_DATA_SIZE);
+    for (unsigned int cls = 1; cls <= 255; cls += 254) {
+        g_assert_cmpint(FEMU_SC(femu_cdl_desc(&c, true, false, 0, cls,
+                                              cls == 1 ? 100000 : 400000,
+                                              0)), ==,
+                        NVME_SUCCESS);
+    }
+    g_assert_cmpint(FEMU_SC(femu_set_feature(&c, FEMU_CDL_FID, false, 0, 4,
+                                             &result)), ==, NVME_SUCCESS);
+    /* Descending creation order must still produce ascending RR. */
+    for (unsigned int i = ARRAY_SIZE(ids); i-- > 0;) {
+        femu_cdl_create_queue(&c, &queues[i], ids[i], 1);
+    }
+    femu_cdl_create_queue(&c, &other, 1024, 255);
+    femu_cdl_test_control(qts, id, "reset");
+    femu_cdl_test_control(qts, id, "hold=1");
+    for (unsigned int turn = 0; turn < 3; turn++) {
+        for (unsigned int i = 0; i < ARRAY_SIZE(ids); i++) {
+            femu_cdl_submit_read(&c, &queues[i], buf);
+        }
+        femu_cdl_submit_read(&c, &other, buf);
+    }
+    femu_cdl_wait_pending(qts, id, 3 * (ARRAY_SIZE(ids) + 1));
+    femu_cdl_test_control(qts, id, "hold=0");
+    for (unsigned int turn = 0; turn < 3; turn++) {
+        for (unsigned int i = 0; i < ARRAY_SIZE(ids); i++) {
+            g_assert_cmpint(FEMU_SC(femu_complete(&c, &queues[i], &got,
+                                                   NULL)), ==, NVME_SUCCESS);
+        }
+        g_assert_cmpint(FEMU_SC(femu_complete(&c, &other, &got, NULL)), ==,
+                        NVME_SUCCESS);
+    }
+    {
+        g_autofree char *state = femu_cdl_test_state(qts, id);
+        char *order = strstr(state, ";order=");
+        g_auto(GStrv) entries = NULL;
+        unsigned int count = 0, others = 0;
+        unsigned int last[2] = { 0, 0 };
+
+        g_assert_nonnull(order);
+        entries = g_strsplit(order + strlen(";order="), ",", -1);
+        g_assert_cmpuint(g_strv_length(entries), ==, 21);
+        for (unsigned int i = 0; entries[i]; i++) {
+            unsigned int cls, sqid, cid;
+
+            g_assert_cmpint(sscanf(entries[i], "%u/%u/%u", &cls, &sqid,
+                                   &cid), ==, 3);
+            /* Equal-sized requests: independent weighted-finish oracle,
+             * including class-ID tie breaking and the class becoming empty.
+             */
+            unsigned int want = count < 18 &&
+                (others == 3 || last[0] + 1 <= last[1] + 4) ? 0 : 1;
+
+            g_assert_cmpuint(cls, ==, want ? 255 : 1);
+            last[want] += want ? 4 : 1;
+            if (cls == 1) {
+                g_assert_cmpuint(sqid, ==, ids[count++ % ARRAY_SIZE(ids)]);
+            } else {
+                g_assert_cmpuint(cls, ==, 255);
+                g_assert_cmpuint(sqid, ==, 1024);
+                others++;
+            }
+        }
+        g_assert_cmpuint(count, ==, 18);
+        g_assert_cmpuint(others, ==, 3);
+    }
+    femu_disable(&c);
+    for (unsigned int i = 0; i < ARRAY_SIZE(ids); i++) {
+        femu_queue_free(&c, &queues[i]);
+    }
+    femu_queue_free(&c, &other);
+    guest_free(alloc, buf);
+}
+
+/* One blocked destination invalidates cached heads in both ready classes. */
+static void femu_test_cdl_cached_backpressure(void *obj, void *data,
+                                             QGuestAllocator *alloc)
+{
+    const char *id = "cdl-cached-pressure";
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    FemuQueue queues[4];
+    uint64_t buf;
+    uint32_t result;
+    uint16_t got;
+
+    femu_enable(&c, &femu->dev, alloc);
+    buf = guest_alloc(alloc, FEMU_DATA_SIZE);
+    for (unsigned int cls = 1; cls <= 2; cls++) {
+        g_assert_cmpint(FEMU_SC(femu_cdl_desc(&c, true, false, 0, cls,
+                                              UINT32_MAX, 0)), ==,
+                        NVME_SUCCESS);
+    }
+    g_assert_cmpint(FEMU_SC(femu_set_feature(&c, FEMU_CDL_FID, false, 0, 4,
+                                             &result)), ==, NVME_SUCCESS);
+    for (unsigned int i = 0; i < 4; i++) {
+        femu_cdl_create_queue(&c, &queues[i], i + 1, 1 + i / 2);
+    }
+    femu_cdl_test_control(qts, id, "reset");
+    femu_cdl_test_control(qts, id, "hold=1");
+    for (unsigned int i = 0; i < 4; i++) {
+        femu_cdl_submit_read(&c, &queues[i], buf);
+    }
+    femu_cdl_wait_pending(qts, id, 4);
+    femu_cdl_test_control(qts, id, "block-poller=1");
+    femu_cdl_test_control(qts, id, "hold=0");
+    {
+        g_autofree char *state = femu_cdl_test_state(qts, id);
+        const char *failed = strstr(state, ";failed-max=");
+        uint64_t failures;
+
+        /* Both classes initially cache a head for poller 1. Refreshing only
+         * the class whose enqueue failed would cause a second failed attempt.
+         */
+        g_assert_nonnull(failed);
+        g_assert_cmpint(sscanf(failed, ";failed-max=%" SCNu64, &failures),
+                        ==, 1);
+        g_test_message("cached backpressure state: %s", state);
+        g_assert_cmpuint(failures, ==, 1);
+    }
+    for (unsigned int i = 1; i < 4; i += 2) {
+        g_assert_cmpint(FEMU_SC(femu_complete(&c, &queues[i], &got, NULL)),
+                        ==, NVME_SUCCESS);
+    }
+    g_assert_false(femu_cq_ready(&c, &queues[0]));
+    g_assert_false(femu_cq_ready(&c, &queues[2]));
+    /* No new admission accompanies recovery. */
+    femu_cdl_test_control(qts, id, "block-poller=0");
+    for (unsigned int i = 0; i < 4; i += 2) {
+        g_assert_cmpint(FEMU_SC(femu_complete(&c, &queues[i], &got, NULL)),
+                        ==, NVME_SUCCESS);
+    }
+    {
+        g_autofree char *state = femu_cdl_test_state(qts, id);
+        char *order = strstr(state, ";order=");
+        g_auto(GStrv) entries = NULL;
+        unsigned int seen = 0;
+
+        g_assert_nonnull(order);
+        entries = g_strsplit(order + strlen(";order="), ",", -1);
+        g_assert_cmpuint(g_strv_length(entries), ==, 4);
+        for (unsigned int i = 0; entries[i]; i++) {
+            unsigned int cls, sqid, cid;
+
+            g_assert_cmpint(sscanf(entries[i], "%u/%u/%u", &cls, &sqid,
+                                   &cid), ==, 3);
+            g_assert_cmpuint(sqid, >=, 1);
+            g_assert_cmpuint(sqid, <=, 4);
+            g_assert_cmpuint(cls, ==, 1 + (sqid - 1) / 2);
+            g_assert_cmpuint(seen & (1u << sqid), ==, 0);
+            seen |= 1u << sqid;
+            if (i < 2) {
+                g_assert_cmpuint(sqid % 2, ==, 0);
+            }
+        }
+    }
+    femu_disable(&c);
+    for (unsigned int i = 0; i < 4; i++) {
+        femu_queue_free(&c, &queues[i]);
+    }
+    guest_free(alloc, buf);
+}
+
 /* Fill actual service rings, then recover with no new I/O submission. */
 static void femu_test_cdl_ring_pressure(void *obj, void *data,
                                         QGuestAllocator *alloc)
@@ -20384,6 +20563,9 @@ static void femu_test_cdl_ring_pressure(void *obj, void *data,
                    strstr(state, ";backend-ready=5;") != NULL) :
                   strstr(state, ";rings=1/7/0;") != NULL) {
             break;
+        }
+        if (poll + 1 == FEMU_POLL_LIMIT_MS) {
+            g_test_message("ring-pressure terminal state: %s", state);
         }
         g_assert_cmpuint(poll, <, FEMU_POLL_LIMIT_MS);
         g_usleep(1000);
@@ -22584,6 +22766,35 @@ static void femu_register_nodes(void)
             .edge.extra_device_opts = g_strdup_printf(
                 "id=cdl-cursor,vid=0x8086,did=0x5845,cdl=on,"
                 "cdl_classes=2,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=1,cdl_file=%s", path),
+        });
+    }
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-bitmap-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-bitmap-boundaries", "femu",
+                     femu_test_cdl_bitmap_boundaries,
+                     &(QOSGraphTestOptions) {
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-bitmap,vid=0x8086,did=0x5845,cdl=on,queues=2047,"
+                "cdl_classes=256,cdl_max_sqs=8,cdl_sqs_per_class=6,"
+                "cdl_bound_classes=2,multipoller_enabled=0,cdl_file=%s", path),
+        });
+    }
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-cached-pressure-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-cached-backpressure", "femu",
+                     femu_test_cdl_cached_backpressure,
+                     &(QOSGraphTestOptions) {
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-cached-pressure,vid=0x8086,did=0x5845,cdl=on,"
+                "queues=4,cdl_classes=3,cdl_max_sqs=4,cdl_sqs_per_class=2,"
+                "cdl_bound_classes=2,multipoller_enabled=1,poller_ratio=2,"
+                "cdl_file=%s", path),
         });
     }
     /* Retain historical fixtures for explicit archaeology, outside the current gate. */

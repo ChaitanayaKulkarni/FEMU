@@ -75,7 +75,8 @@ static bool nvme_try_post_cqe(FemuCtrl *n, NvmeCQueue *cq, NvmeRequest *req)
     full = nvme_cq_full(cq);
     if (!full) {
         nvme_post_cqe(cq, req);
-        if (n->cdl_profile && req->cdl_attempt) {
+        if (n->cdl_profile && req->cdl_attempt &&
+            trace_event_get_state_backends(TRACE_FEMU_CDL_CQ_POST)) {
             trace_femu_cdl_cq_post(n->cdl_trace_id, req->cdl_attempt,
                                    req->sq->sqid,
                                    le16_to_cpu(req->cmd.cid),
@@ -127,9 +128,30 @@ static void nvme_trace_bypass_dispatch(FemuCtrl *n, NvmeRequest *req)
     }
 }
 
-static void nvme_retry_ftl_backlog(FemuCtrl *n, int poller)
+void nvme_ftl_backlog_inc(FemuCtrl *n, int poller)
+{
+    uint32_t old = qatomic_fetch_inc(&n->ftl_backlog_count[poller]);
+
+    if (!old) {
+        qatomic_inc(&n->ftl_backlogs_nonempty);
+    }
+}
+
+void nvme_ftl_backlog_dec(FemuCtrl *n, int poller)
+{
+    uint32_t old = qatomic_fetch_dec(&n->ftl_backlog_count[poller]);
+
+    assert(old);
+    if (old == 1) {
+        old = qatomic_fetch_dec(&n->ftl_backlogs_nonempty);
+        assert(old);
+    }
+}
+
+static bool nvme_retry_ftl_backlog(FemuCtrl *n, int poller)
 {
     union cq_req_list *backlog = &n->ftl_backlog[poller];
+    bool had_backlog = !QTAILQ_EMPTY(backlog);
 
     while (!QTAILQ_EMPTY(backlog)) {
         NvmeRequest *req = QTAILQ_FIRST(backlog);
@@ -139,10 +161,9 @@ static void nvme_retry_ftl_backlog(FemuCtrl *n, int poller)
         }
         QTAILQ_REMOVE(backlog, req, entry);
         nvme_trace_bypass_dispatch(n, req);
-        assert(qatomic_read(&n->ftl_backlog_count[poller]));
-        qatomic_set(&n->ftl_backlog_count[poller],
-                    qatomic_read(&n->ftl_backlog_count[poller]) - 1);
+        nvme_ftl_backlog_dec(n, poller);
     }
+    return had_backlog && QTAILQ_EMPTY(backlog);
 }
 
 void nvme_enqueue_or_backlog(FemuCtrl *n, NvmeRequest *req, int poller)
@@ -156,8 +177,7 @@ void nvme_enqueue_or_backlog(FemuCtrl *n, NvmeRequest *req, int poller)
         return;
     }
     QTAILQ_INSERT_TAIL(backlog, req, entry);
-    qatomic_set(&n->ftl_backlog_count[poller],
-                qatomic_read(&n->ftl_backlog_count[poller]) + 1);
+    nvme_ftl_backlog_inc(n, poller);
 }
 
 static void nvme_update_sq_eventidx(const NvmeSQueue *sq)
@@ -246,7 +266,13 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
     bool inline_mode = NOSSD(n) && n->hiops_inline;
     bool did_isr = false;
 
-    nvme_retry_ftl_backlog(n, index_poller);
+    if (nvme_retry_ftl_backlog(n, index_poller)) {
+        /* Retiring the last ordinary backlog entry makes this destination
+         * eligible for CDL work.  This replaces the old scheduler call made
+         * after every active SQ on every otherwise idle poller sweep.
+         */
+        cdl_dispatch(n);
+    }
     nvme_update_sq_tail(sq);
     /*
      * One request per ring slot, handed to the FTL and only returned on
@@ -351,10 +377,12 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
                 QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
                 break;
             }
-            trace_femu_cdl_fetch(n->cdl_trace_id, req->cdl_attempt,
-                                   sq->sqid, le16_to_cpu(cmd.cid),
-                                 sq->cdl_class, cmd.opcode,
-                                 cdl_clock_now_ns(n));
+            if (trace_event_get_state_backends(TRACE_FEMU_CDL_FETCH)) {
+                trace_femu_cdl_fetch(n->cdl_trace_id, req->cdl_attempt,
+                                     sq->sqid, le16_to_cpu(cmd.cid),
+                                     sq->cdl_class, cmd.opcode,
+                                     cdl_clock_now_ns(n));
+            }
             cdl_test_advance(n, CDL_TEST_DELAY_FETCH);
             if (!cdl_test_barrier_wait(n, CDL_BARRIER_FETCH)) {
                 QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
@@ -392,10 +420,12 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->status = status;
         if (n->cdl_profile) {
             cdl_test_advance(n, CDL_TEST_DELAY_VALIDATION);
-            trace_femu_cdl_validation(n->cdl_trace_id, req->cdl_attempt,
-                                   sq->sqid, le16_to_cpu(cmd.cid),
-                                      sq->cdl_class, cmd.opcode, status,
-                                      cdl_clock_now_ns(n));
+            if (trace_event_get_state_backends(TRACE_FEMU_CDL_VALIDATION)) {
+                trace_femu_cdl_validation(n->cdl_trace_id, req->cdl_attempt,
+                                          sq->sqid, le16_to_cpu(cmd.cid),
+                                          sq->cdl_class, cmd.opcode, status,
+                                          cdl_clock_now_ns(n));
+            }
         }
 
         /*
@@ -531,7 +561,6 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
 
     nvme_update_sq_eventidx(sq);
     sq->completed += processed;
-    cdl_dispatch(n);
 }
 
 static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req)
@@ -643,9 +672,12 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         }
         assert(req);
 
-        /* A successful dequeue frees a scheduler destination slot. */
-        nvme_retry_ftl_backlog(n, index_poller);
-        cdl_dispatch(n);
+        /* Ordinary retained work has priority for this destination. Only its
+         * empty transition can make a CDL candidate newly dispatchable.
+         */
+        if (nvme_retry_ftl_backlog(n, index_poller)) {
+            cdl_dispatch(n);
+        }
 
         /* NoSSD has no FTL worker, so dispatched CDL effects execute here. */
         if (req->cdl_admitted && !req->cdl_executed &&
@@ -692,12 +724,16 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
 
         if (req->cdl_admitted && !req->cdl_checked) {
             cdl_test_advance(n, CDL_TEST_DELAY_BACKEND);
-            trace_femu_cdl_backend_complete(n->cdl_trace_id, req->cdl_attempt,
-                                   req->sq->sqid,
-                                            le16_to_cpu(req->cmd.cid),
-                                            req->wfq_cdl_class,
-                                            req->status,
-                                            cdl_clock_now_ns(n));
+            if (trace_event_get_state_backends(
+                    TRACE_FEMU_CDL_BACKEND_COMPLETE)) {
+                trace_femu_cdl_backend_complete(n->cdl_trace_id,
+                                                req->cdl_attempt,
+                                                req->sq->sqid,
+                                                le16_to_cpu(req->cmd.cid),
+                                                req->wfq_cdl_class,
+                                                req->status,
+                                                cdl_clock_now_ns(n));
+            }
         }
 
         /* TP4221: CDL miss detection and WFQ slot release */

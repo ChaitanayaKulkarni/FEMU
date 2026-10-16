@@ -1878,22 +1878,26 @@ static uint64_t femu_ftl_process_req(FemuCtrl *n, NvmeRequest *req)
  */
 static void femu_ftl_complete_pending(FemuCtrl *n)
 {
-    NvmeRequest *req, *next;
+    NvmeRequest *req;
+    uint32_t scan = qatomic_read(&n->ftl_pending_count);
+    int64_t now;
 
-    /* Complete modeled NAND work without statistics or host filesystem I/O. */
-    QTAILQ_FOREACH(req, &n->ftl_pending, entry) {
-        if (req->cdl_checked || nvme_io_clock(n) < req->expire_time) {
-            continue;
-        }
-        cdl_test_advance(n, CDL_TEST_DELAY_BACKEND);
-        trace_femu_cdl_backend_complete(n->cdl_trace_id, req->cdl_attempt,
-            req->sq->sqid, le16_to_cpu(req->cmd.cid), req->wfq_cdl_class,
-            req->status, cdl_clock_now_ns(n));
-        if (!cdl_check(n, req)) {
-            return;
-        }
+    if (!scan) {
+        n->ftl_pending_next_ns = 0;
+        return;
     }
-    QTAILQ_FOREACH_SAFE(req, &n->ftl_pending, entry, next) {
+    now = nvme_io_clock(n);
+    if (n->ftl_pending_next_ns > now) {
+        return;
+    }
+    n->ftl_pending_next_ns = INT64_MAX;
+
+    /*
+     * Check and publish each due request in one traversal. A single readiness
+     * timestamp gives the pass a stable cutoff; cdl_check() still takes the
+     * request's exact stop timestamp for deadline accounting.
+     */
+    while (scan-- && (req = QTAILQ_FIRST(&n->ftl_pending))) {
         int poller;
 
         if (!qatomic_read(&n->dataplane_started) || n->ftl_stopping ||
@@ -1901,7 +1905,25 @@ static void femu_ftl_complete_pending(FemuCtrl *n)
             return;
         }
         if (!req->cdl_checked) {
-            continue;
+            if (now < req->expire_time) {
+                n->ftl_pending_next_ns = MIN(n->ftl_pending_next_ns,
+                                             req->expire_time);
+                QTAILQ_REMOVE(&n->ftl_pending, req, entry);
+                QTAILQ_INSERT_TAIL(&n->ftl_pending, req, entry);
+                continue;
+            }
+            cdl_test_advance(n, CDL_TEST_DELAY_BACKEND);
+            if (trace_event_get_state_backends(
+                    TRACE_FEMU_CDL_BACKEND_COMPLETE)) {
+                trace_femu_cdl_backend_complete(n->cdl_trace_id,
+                    req->cdl_attempt, req->sq->sqid,
+                    le16_to_cpu(req->cmd.cid), req->wfq_cdl_class,
+                    req->status, cdl_clock_now_ns(n));
+            }
+            if (!cdl_check(n, req)) {
+                n->ftl_pending_next_ns = 0;
+                return;
+            }
         }
         poller = req->wfq_poller_idx;
         QTAILQ_REMOVE(&n->ftl_pending, req, entry);
@@ -1910,7 +1932,12 @@ static void femu_ftl_complete_pending(FemuCtrl *n)
         if (femu_ring_enqueue(n->to_poller[poller], (void *)&req, 1) != 1) {
             QTAILQ_INSERT_TAIL(&n->ftl_pending, req, entry);
             qatomic_inc(&n->ftl_pending_count);
+            /* This checked request is ready as soon as the ring has room. */
+            n->ftl_pending_next_ns = 0;
         }
+    }
+    if (n->ftl_pending_next_ns == INT64_MAX) {
+        n->ftl_pending_next_ns = 0;
     }
 }
 
@@ -1970,8 +1997,13 @@ static void *femu_ftl_thread(void *arg)
                 }
                 issued = true;
 
-                /* Retry retained CDL work as soon as a backend-ring slot opens. */
-                cdl_dispatch(n);
+                /* Request-local fields were published before ring enqueue.
+                 * Retry the scheduler only after an enqueue actually observed
+                 * this destination full.
+                 */
+                if (qatomic_xchg(&n->cdl_dispatch_kick, 0)) {
+                    cdl_dispatch(n);
+                }
 
                 if (req->cdl_admitted &&
                     !cdl_test_barrier_wait(n, CDL_BARRIER_DISPATCH)) {
@@ -2011,6 +2043,12 @@ static void *femu_ftl_thread(void *arg)
                     trace_femu_cdl_backend_issue(n->cdl_trace_id, req->cdl_attempt,
                         req->sq->sqid, le16_to_cpu(req->cmd.cid),
                         req->wfq_cdl_class, lat, req->expire_time);
+                    if (!qatomic_read(&n->ftl_pending_count)) {
+                        n->ftl_pending_next_ns = req->expire_time;
+                    } else if (n->ftl_pending_next_ns &&
+                               req->expire_time < n->ftl_pending_next_ns) {
+                        n->ftl_pending_next_ns = req->expire_time;
+                    }
                     QTAILQ_INSERT_TAIL(&n->ftl_pending, req, entry);
                     qatomic_inc(&n->ftl_pending_count);
                     n->ftl_in_sweep = false;
@@ -2027,17 +2065,20 @@ static void *femu_ftl_thread(void *arg)
 
                 n->ftl_in_sweep = false;
             }
+            /* Bound completion/accounting delay to one request per poller,
+             * rather than a whole wfq_depth-sized issue batch per poller.
+             */
+            n->ftl_in_sweep = true;
+            smp_mb();
+            if (qatomic_read(&n->dataplane_started)) {
+                femu_ftl_complete_pending(n);
+            }
+            n->ftl_in_sweep = false;
             if (!issued || !qatomic_read(&n->dataplane_started) ||
                 qatomic_read(&n->cdl_store_failed) || n->ftl_stopping) {
                 break;
             }
         }
-        n->ftl_in_sweep = true;
-        smp_mb();
-        if (qatomic_read(&n->dataplane_started)) {
-            femu_ftl_complete_pending(n);
-        }
-        n->ftl_in_sweep = false;
     }
 
     return NULL;
@@ -2666,6 +2707,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     }
 
     QTAILQ_INIT(&n->ftl_pending);
+    n->ftl_pending_next_ns = 0;
     n->use_ftl_thread = femu_needs_ftl_thread(n);
     if (n->use_ftl_thread) {
         qemu_thread_create(&n->ftl_thread, "FEMU-FTL-Thread", femu_ftl_thread,
@@ -2738,6 +2780,7 @@ static void nvme_destroy_poller(FemuCtrl *n)
     n->ftl_backlog = NULL;
     g_free(n->ftl_backlog_count);
     n->ftl_backlog_count = NULL;
+    qatomic_set(&n->ftl_backlogs_nonempty, 0);
     g_free((void *)n->poller_in_sweep);
     n->poller_in_sweep = NULL;
     qemu_vfree(n->poller_ctr);   /* allocated with qemu_memalign */
