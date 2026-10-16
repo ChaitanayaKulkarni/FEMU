@@ -22533,6 +22533,59 @@ static void femu_register_nodes(void)
     femu_cdl_file = g_strdup_printf("%s/femu-cdl-v2-%d.state",
                                     g_get_tmp_dir(), (int)getpid());
     femu_cdl_clean_store(femu_cdl_file);
+    /* Scheduler membership regressions require no retired statistics ABI. */
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-rr-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-round-robin", "femu", femu_test_cdl_round_robin,
+                     &(QOSGraphTestOptions) {
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-rr,vid=0x8086,did=0x5845,cdl=on,"
+                "cdl_classes=2,cdl_max_sqs=11,cdl_sqs_per_class=11,cdl_bound_classes=1,cdl_file=%s,queues=11,multipoller_enabled=1,poller_ratio=1", path),
+        });
+    }
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-backpressure-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-backpressure", "femu",
+                     femu_test_cdl_backpressure,
+                     &(QOSGraphTestOptions) {
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-backpressure,vid=0x8086,did=0x5845,cdl=on,"
+                "cdl_classes=2,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=1,multipoller_enabled=1,poller_ratio=1,"
+                "cdl_file=%s", path),
+        });
+    }
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-mixed-rr-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-mixed-round-robin", "femu",
+                     femu_test_cdl_mixed_round_robin,
+                     &(QOSGraphTestOptions) {
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-mixed-rr,vid=0x8086,did=0x5845,cdl=on,"
+                "cdl_classes=3,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=2,cdl_file=%s", path),
+        });
+    }
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-cursor-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-cursor-membership", "femu",
+                     femu_test_cdl_cursor_membership,
+                     &(QOSGraphTestOptions) {
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-cursor,vid=0x8086,did=0x5845,cdl=on,"
+                "cdl_classes=2,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=1,cdl_file=%s", path),
+        });
+    }
     /* Retain historical fixtures for explicit archaeology, outside the current gate. */
     if (g_getenv("FEMU_CDL_LEGACY_TESTS")) {
     for (unsigned i = 0; i < 2; i++) {
@@ -22770,58 +22823,10 @@ static void femu_register_nodes(void)
                 path),
         });
     }
-    {
-        char *path = g_strdup_printf("%s/femu-cdl-rr-%d.state",
-                                     g_get_tmp_dir(), (int)getpid());
 
-        femu_cdl_clean_store(path);
-        qos_add_test("cdl-round-robin", "femu", femu_test_cdl_round_robin,
-                     &(QOSGraphTestOptions) {
-            .edge.extra_device_opts = g_strdup_printf(
-                "id=cdl-rr,vid=0x8086,did=0x5845,cdl=on,"
-                "cdl_classes=2,cdl_max_sqs=11,cdl_sqs_per_class=11,cdl_bound_classes=1,cdl_file=%s,queues=11,multipoller_enabled=1,poller_ratio=1", path),
-        });
-    }
-    {
-        char *path = g_strdup_printf("%s/femu-cdl-backpressure-%d.state",
-                                     g_get_tmp_dir(), (int)getpid());
 
-        femu_cdl_clean_store(path);
-        qos_add_test("cdl-backpressure", "femu",
-                     femu_test_cdl_backpressure,
-                     &(QOSGraphTestOptions) {
-            .edge.extra_device_opts = g_strdup_printf(
-                "id=cdl-backpressure,vid=0x8086,did=0x5845,cdl=on,"
-                "cdl_classes=2,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=1,multipoller_enabled=1,poller_ratio=1,"
-                "cdl_file=%s", path),
-        });
-    }
-    {
-        char *path = g_strdup_printf("%s/femu-cdl-mixed-rr-%d.state",
-                                     g_get_tmp_dir(), (int)getpid());
 
-        femu_cdl_clean_store(path);
-        qos_add_test("cdl-mixed-round-robin", "femu",
-                     femu_test_cdl_mixed_round_robin,
-                     &(QOSGraphTestOptions) {
-            .edge.extra_device_opts = g_strdup_printf(
-                "id=cdl-mixed-rr,vid=0x8086,did=0x5845,cdl=on,"
-                "cdl_classes=3,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=2,cdl_file=%s", path),
-        });
-    }
-    {
-        char *path = g_strdup_printf("%s/femu-cdl-cursor-%d.state",
-                                     g_get_tmp_dir(), (int)getpid());
 
-        femu_cdl_clean_store(path);
-        qos_add_test("cdl-cursor-membership", "femu",
-                     femu_test_cdl_cursor_membership,
-                     &(QOSGraphTestOptions) {
-            .edge.extra_device_opts = g_strdup_printf(
-                "id=cdl-cursor,vid=0x8086,did=0x5845,cdl=on,"
-                "cdl_classes=2,cdl_max_sqs=8,cdl_sqs_per_class=8,cdl_bound_classes=1,cdl_file=%s", path),
-        });
-    }
     {
         char *path = g_strdup_printf("%s/femu-cdl-excluded-%d.state",
                                      g_get_tmp_dir(), (int)getpid());

@@ -840,6 +840,7 @@ bool cdl_init(FemuCtrl *n, Error **errp)
     n->cdl_saved_desc_present = g_new0(bool, n->cdl_num_classes);
     n->cdl_assoc = g_new0(uint32_t, n->cdl_num_classes);
     n->cdl_inflight_by_class = g_new0(uint32_t, n->cdl_num_classes);
+    n->cdl_members = g_new0(union cdl_sq_list, n->cdl_num_classes);
     n->cdl_dispatch_wait = g_new0(uint16_t, n->cdl_num_classes);
     n->wfq_f_last = g_new0(uint64_t, n->cdl_num_classes);
     n->cdl_rr_next = g_new0(uint16_t, n->cdl_num_classes);
@@ -902,6 +903,7 @@ void cdl_exit(FemuCtrl *n)
     g_clear_pointer(&n->cdl_saved_desc_present, g_free);
     g_clear_pointer(&n->cdl_assoc, g_free);
     g_clear_pointer(&n->cdl_inflight_by_class, g_free);
+    g_clear_pointer(&n->cdl_members, g_free);
     g_clear_pointer(&n->cdl_dispatch_wait, g_free);
     g_clear_pointer(&n->wfq_f_last, g_free);
     g_clear_pointer(&n->cdl_rr_next, g_free);
@@ -967,21 +969,24 @@ static NvmeRequest *cdl_class_candidate(FemuCtrl *n, uint8_t cls,
                                         const bool *blocked)
 {
     uint16_t start = n->cdl_rr_next[cls];
+    NvmeSQueue *sq;
 
-    if (!start) {
-        start = 1;
-    }
-    for (uint32_t step = 0; step < n->nr_io_queues; step++) {
-        uint16_t qid = 1 + (start - 1 + step) % n->nr_io_queues;
-        NvmeSQueue *sq = n->sq[qid];
+    /* Membership is sorted by SQID; preserve ascending, wrapping RR order.
+     * Empty classes cost O(1), and a class visits only its own bound SQs.
+     * The caller holds cdl_lock, including across queue publication/removal.
+     */
+    for (unsigned int pass = 0; pass < 2; pass++) {
+        QTAILQ_FOREACH(sq, &n->cdl_members[cls], cdl_member_entry) {
+            NvmeRequest *req;
 
-        if (!sq || !sq->is_active || sq->cdl_class != cls ||
-            QTAILQ_EMPTY(&sq->cdl_pending)) {
-            continue;
-        }
-        NvmeRequest *req = QTAILQ_FIRST(&sq->cdl_pending);
-        if (!blocked || !blocked[req->wfq_poller_idx]) {
-            return req;
+            if ((pass == 0 ? sq->sqid < start : sq->sqid >= start) ||
+                !sq->is_active || QTAILQ_EMPTY(&sq->cdl_pending)) {
+                continue;
+            }
+            req = QTAILQ_FIRST(&sq->cdl_pending);
+            if (!blocked || !blocked[req->wfq_poller_idx]) {
+                return req;
+            }
         }
     }
     return NULL;
@@ -989,15 +994,21 @@ static NvmeRequest *cdl_class_candidate(FemuCtrl *n, uint8_t cls,
 
 static uint16_t cdl_next_member(FemuCtrl *n, uint8_t cls, uint16_t after)
 {
-    for (uint32_t step = 1; step <= n->nr_io_queues; step++) {
-        uint16_t qid = 1 + (after - 1 + step) % n->nr_io_queues;
-        NvmeSQueue *sq = n->sq[qid];
+    NvmeSQueue *sq;
+    uint16_t first = 0;
 
-        if (sq && sq->is_active && sq->cdl_class == cls) {
-            return qid;
+    QTAILQ_FOREACH(sq, &n->cdl_members[cls], cdl_member_entry) {
+        if (!sq->is_active) {
+            continue;
+        }
+        if (!first) {
+            first = sq->sqid;
+        }
+        if (sq->sqid > after) {
+            return sq->sqid;
         }
     }
-    return 0;
+    return first;
 }
 
 static uint64_t cdl_finish_tag(FemuCtrl *n, uint8_t cls, NvmeRequest *req)
@@ -1196,12 +1207,23 @@ void cdl_sq_unreserve(FemuCtrl *n, uint8_t cls)
 void cdl_sq_created(FemuCtrl *n, NvmeSQueue *sq)
 {
     uint8_t cls = sq->cdl_class;
+    NvmeSQueue *member;
 
     if (!n->cdl_profile || !cls) {
         return;
     }
     pthread_spin_lock(&n->cdl_lock);
     assert(sq->cdl_quota_reserved && n->cdl_assoc[cls]);
+    QTAILQ_FOREACH(member, &n->cdl_members[cls], cdl_member_entry) {
+        if (member->sqid > sq->sqid) {
+            break;
+        }
+    }
+    if (member) {
+        QTAILQ_INSERT_BEFORE(member, sq, cdl_member_entry);
+    } else {
+        QTAILQ_INSERT_TAIL(&n->cdl_members[cls], sq, cdl_member_entry);
+    }
     if (!n->cdl_rr_next[cls] ||
         (!n->cdl_rr_started[cls] && sq->sqid < n->cdl_rr_next[cls])) {
         n->cdl_rr_next[cls] = sq->sqid;
@@ -1237,22 +1259,13 @@ void cdl_sq_deleted(FemuCtrl *n, NvmeSQueue *sq)
     assert(sq->cdl_quota_reserved);
     cdl_sq_unreserve_locked(n, cls);
     sq->cdl_quota_reserved = false;
+    QTAILQ_REMOVE(&n->cdl_members[cls], sq, cdl_member_entry);
     if (!n->cdl_assoc[cls]) {
         n->cdl_rr_started[cls] = false;
     }
     if (n->cdl_rr_next[cls] == sq->sqid) {
-        n->cdl_rr_next[cls] = 0;
-        for (uint32_t step = 1; step <= n->nr_io_queues; step++) {
-            uint16_t qid = n->cdl_rr_started[cls] ?
-                1 + (sq->sqid - 1 + step) % n->nr_io_queues : step;
-            NvmeSQueue *candidate = n->sq[qid];
-
-            if (qid != sq->sqid && candidate && candidate->is_active &&
-                candidate->cdl_class == cls) {
-                n->cdl_rr_next[cls] = qid;
-                break;
-            }
-        }
+        n->cdl_rr_next[cls] = cdl_next_member(n, cls,
+            n->cdl_rr_started[cls] ? sq->sqid : 0);
     }
     cdl_dispatch_locked(n);
     pthread_spin_unlock(&n->cdl_lock);
@@ -1419,6 +1432,9 @@ void wfq_init(FemuCtrl *n)
     n->wfq_v_clock = 0;
     if (!n->cdl_profile) {
         return;
+    }
+    for (uint32_t c = 0; c < n->cdl_num_classes; c++) {
+        QTAILQ_INIT(&n->cdl_members[c]);
     }
     memset(n->cdl_inflight_by_class, 0,
            n->cdl_num_classes * sizeof(*n->cdl_inflight_by_class));

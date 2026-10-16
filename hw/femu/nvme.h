@@ -1844,6 +1844,7 @@ typedef struct NvmeSQueue {
     /* TP4221 CDL: immutable Create I/O SQ class binding. */
     uint8_t     cdl_class;
     bool        cdl_quota_reserved;
+    QTAILQ_ENTRY(NvmeSQueue) cdl_member_entry;
     QTAILQ_HEAD(, NvmeRequest) cdl_pending;
 } NvmeSQueue;
 
@@ -2444,6 +2445,7 @@ typedef struct FemuCtrl {
     uint32_t            cdl_pending;
     uint32_t            wfq_inflight;
     uint32_t            *cdl_inflight_by_class;
+    QTAILQ_HEAD(cdl_sq_list, NvmeSQueue) *cdl_members;
     uint16_t            *cdl_dispatch_wait;
     uint64_t            wfq_v_clock;
     uint64_t            *wfq_f_last;
