@@ -97,6 +97,12 @@ def validate_trace(directory: Path) -> dict:
             timed = "admission" in names
             allowed = expected if timed else ["fetch", "validation"] + (
                 ["bypass_dispatch"] if "bypass_dispatch" in names else []) + ["cq_post"]
+            if timed and "backend_issue" in names:
+                allowed = allowed.copy()
+                allowed.insert(allowed.index("backend_complete"), "backend_issue")
+            if timed and "persist_latency" in names:
+                allowed = allowed.copy()
+                allowed.insert(allowed.index("cq_post"), "persist_latency")
             if names != allowed[:len(names)]:
                 errors.append(f"{description}: lifecycle order {names}")
                 continue

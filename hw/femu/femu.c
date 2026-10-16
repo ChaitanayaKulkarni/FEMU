@@ -1877,6 +1877,47 @@ static uint64_t femu_ftl_process_req(FemuCtrl *n, NvmeRequest *req)
  * rather than one per mode, so that a controller whose namespaces do not share a
  * mode still has a single reader per ring.
  */
+static void femu_ftl_complete_pending(FemuCtrl *n)
+{
+    NvmeRequest *req, *next;
+
+    /* Freeze all ready results before any durable store operation can block. */
+    QTAILQ_FOREACH(req, &n->ftl_pending, entry) {
+        if (req->cdl_checked || nvme_io_clock(n) < req->expire_time) {
+            continue;
+        }
+        cdl_test_advance(n, CDL_TEST_DELAY_BACKEND);
+        trace_femu_cdl_backend_complete(n->cdl_trace_id, req->cdl_attempt,
+            req->sq->sqid, le16_to_cpu(req->cmd.cid), req->wfq_cdl_class,
+            req->status, cdl_clock_now_ns(n));
+        if (!cdl_check(n, req)) {
+            return;
+        }
+    }
+    QTAILQ_FOREACH_SAFE(req, &n->ftl_pending, entry, next) {
+        int poller;
+
+        if (!qatomic_read(&n->dataplane_started) || n->ftl_stopping ||
+            n->cdl_store_failed) {
+            return;
+        }
+        if (!req->cdl_checked) {
+            continue;
+        }
+        if (!cdl_account(n, req)) {
+            return;
+        }
+        poller = req->wfq_poller_idx;
+        QTAILQ_REMOVE(&n->ftl_pending, req, entry);
+        qatomic_dec(&n->ftl_pending_count);
+        /* Once published, the poller can recycle req immediately. */
+        if (femu_ring_enqueue(n->to_poller[poller], (void *)&req, 1) != 1) {
+            QTAILQ_INSERT_TAIL(&n->ftl_pending, req, entry);
+            qatomic_inc(&n->ftl_pending_count);
+        }
+    }
+}
+
 static void *femu_ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -1905,97 +1946,102 @@ static void *femu_ftl_thread(void *arg)
             continue;
         }
 
-        for (i = 1; i <= n->nr_pollers; i++) {
-            if (!n->to_ftl[i] || !femu_ring_count(n->to_ftl[i])) {
-                continue;
-            }
+        /* Issue a bounded batch without sleeping through each NAND latency. */
+        for (unsigned batch = 0; batch < MAX(1, n->wfq_depth); batch++) {
+            bool issued = false;
+            for (i = 1; i <= n->nr_pollers; i++) {
+                if (!n->to_ftl[i] || !femu_ring_count(n->to_ftl[i])) {
+                    continue;
+                }
 
-            /*
-             * Publish the flag only around a request actually being handled.
-             * Doing it once per pass would put a barrier in the idle spin,
-             * which changes how this thread and the pollers interleave.
-             */
-            n->ftl_in_sweep = true;
-            smp_mb();   /* publish the flag before re-reading the pause state */
-            if (!n->dataplane_started) {
+                /*
+                 * Publish the flag only around a request actually being handled.
+                 * Doing it once per pass would put a barrier in the idle spin,
+                 * which changes how this thread and the pollers interleave.
+                 */
+                n->ftl_in_sweep = true;
+                smp_mb();   /* publish the flag before re-reading the pause state */
+                if (!n->dataplane_started) {
+                    n->ftl_in_sweep = false;
+                    break;
+                }
+
+                rc = femu_ring_dequeue(n->to_ftl[i], (void *)&req, 1);
+                if (rc != 1) {
+                    femu_err("FEMU: FTL to_ftl dequeue failed\n");
+                    n->ftl_in_sweep = false;
+                    continue;
+                }
+                issued = true;
+
+                /* Retry retained CDL work as soon as a backend-ring slot opens. */
+                cdl_dispatch(n);
+
+                if (req->cdl_admitted &&
+                    !cdl_test_barrier_wait(n, CDL_BARRIER_DISPATCH)) {
+                    n->ftl_in_sweep = false;
+                    continue;
+                }
+
+                if (nvme_ns_shared(n)) {
+                    qemu_mutex_lock(&n->subsys->ns_lock);
+                    n->subsys->storage->features.volatile_wc =
+                        n->features.volatile_wc;
+                }
+                lat = femu_ftl_process_req(n, req);
+                g_clear_pointer(&req->write_data, g_free);
+                if (n->power_loss && req->status == NVME_SUCCESS && req->ns) {
+                    FemuPollerCtr *ctr = &n->poller_ctr[i];
+                    uint8_t idx = NVME_ID_NS_FLBAS_INDEX(req->ns->id_ns.flbas);
+                    uint64_t bytes = (uint64_t)req->nlb <<
+                                     req->ns->id_ns.lbaf[idx].lbads;
+
+                    if (req->cmd.opcode == NVME_CMD_WRITE) {
+                        ctr->nr_host_wr_cmds++;
+                        ctr->nr_host_wr_bytes += bytes;
+                    } else if (req->cmd.opcode == NVME_CMD_READ) {
+                        ctr->nr_host_rd_cmds++;
+                        ctr->nr_host_rd_bytes += bytes;
+                    }
+                }
+                if (nvme_ns_shared(n)) {
+                    qemu_mutex_unlock(&n->subsys->ns_lock);
+                }
+                req->reqlat = lat;
+                req->expire_time += lat;
+
+                if (req->cdl_admitted) {
+                    nvme_apply_service_delay(n, req);
+                    trace_femu_cdl_backend_issue(n->cdl_trace_id, req->cdl_attempt,
+                        req->sq->sqid, le16_to_cpu(req->cmd.cid),
+                        req->wfq_cdl_class, lat, req->expire_time);
+                    QTAILQ_INSERT_TAIL(&n->ftl_pending, req, entry);
+                    qatomic_inc(&n->ftl_pending_count);
+                    n->ftl_in_sweep = false;
+                    continue;
+                }
+                /* Retain ownership while completion service is backpressured. */
+                do {
+                    rc = femu_ring_enqueue(n->to_poller[i], (void *)&req, 1);
+                    if (rc != 1) {
+                        g_usleep(50);
+                    }
+                } while (rc != 1 && qatomic_read(&n->dataplane_started) &&
+                         !n->ftl_stopping && !n->cdl_store_failed);
+
                 n->ftl_in_sweep = false;
+            }
+            if (!issued || !qatomic_read(&n->dataplane_started) ||
+                qatomic_read(&n->cdl_store_failed) || n->ftl_stopping) {
                 break;
             }
-
-            rc = femu_ring_dequeue(n->to_ftl[i], (void *)&req, 1);
-            if (rc != 1) {
-                femu_err("FEMU: FTL to_ftl dequeue failed\n");
-                n->ftl_in_sweep = false;
-                continue;
-            }
-
-            /* Retry retained CDL work as soon as a backend-ring slot opens. */
-            cdl_dispatch(n);
-
-            if (req->cdl_admitted &&
-                !cdl_test_barrier_wait(n, CDL_BARRIER_DISPATCH)) {
-                n->ftl_in_sweep = false;
-                continue;
-            }
-
-            if (nvme_ns_shared(n)) {
-                qemu_mutex_lock(&n->subsys->ns_lock);
-                n->subsys->storage->features.volatile_wc =
-                    n->features.volatile_wc;
-            }
-            lat = femu_ftl_process_req(n, req);
-            g_clear_pointer(&req->write_data, g_free);
-            if (n->power_loss && req->status == NVME_SUCCESS && req->ns) {
-                FemuPollerCtr *ctr = &n->poller_ctr[i];
-                uint8_t idx = NVME_ID_NS_FLBAS_INDEX(req->ns->id_ns.flbas);
-                uint64_t bytes = (uint64_t)req->nlb <<
-                                 req->ns->id_ns.lbaf[idx].lbads;
-
-                if (req->cmd.opcode == NVME_CMD_WRITE) {
-                    ctr->nr_host_wr_cmds++;
-                    ctr->nr_host_wr_bytes += bytes;
-                } else if (req->cmd.opcode == NVME_CMD_READ) {
-                    ctr->nr_host_rd_cmds++;
-                    ctr->nr_host_rd_bytes += bytes;
-                }
-            }
-            if (nvme_ns_shared(n)) {
-                qemu_mutex_unlock(&n->subsys->ns_lock);
-            }
-            req->reqlat = lat;
-            req->expire_time += lat;
-
-            if (req->cdl_admitted) {
-                nvme_apply_service_delay(n, req);
-                /* Modeled service completes before the completion ring. */
-                while (nvme_io_clock(n) < req->expire_time &&
-                       qatomic_read(&n->dataplane_started) && !n->ftl_stopping) {
-                    g_usleep(50);
-                }
-                if (!qatomic_read(&n->dataplane_started) || n->ftl_stopping) {
-                    n->ftl_in_sweep = false;
-                    continue;
-                }
-                cdl_test_advance(n, CDL_TEST_DELAY_BACKEND);
-                trace_femu_cdl_backend_complete(n->cdl_trace_id, req->cdl_attempt,
-                    req->sq->sqid, le16_to_cpu(req->cmd.cid),
-                    req->wfq_cdl_class, req->status, cdl_clock_now_ns(n));
-                if (!cdl_account(n, req)) {
-                    n->ftl_in_sweep = false;
-                    continue;
-                }
-            }
-            /* Retain ownership while completion service is backpressured. */
-            do {
-                rc = femu_ring_enqueue(n->to_poller[i], (void *)&req, 1);
-                if (rc != 1) {
-                    g_usleep(50);
-                }
-            } while (rc != 1 && qatomic_read(&n->dataplane_started) &&
-                     !n->ftl_stopping && !n->cdl_store_failed);
-
-            n->ftl_in_sweep = false;
         }
+        n->ftl_in_sweep = true;
+        smp_mb();
+        if (qatomic_read(&n->dataplane_started)) {
+            femu_ftl_complete_pending(n);
+        }
+        n->ftl_in_sweep = false;
     }
 
     return NULL;
@@ -2623,6 +2669,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
         femu_cxl_nvme_ops->attach(n, &n->namespaces[0]);
     }
 
+    QTAILQ_INIT(&n->ftl_pending);
     n->use_ftl_thread = femu_needs_ftl_thread(n);
     if (n->use_ftl_thread) {
         qemu_thread_create(&n->ftl_thread, "FEMU-FTL-Thread", femu_ftl_thread,

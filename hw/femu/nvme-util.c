@@ -538,6 +538,18 @@ void nvme_drain_sq(FemuCtrl *n, NvmeSQueue *sq)
     /* first, so nothing posts a completion for this queue after the drain */
     femu_csd_drain_sq(n, sq);
 
+    /* The paused FTL worker can also retain executed, not-yet-posted work. */
+    {
+        NvmeRequest *next;
+
+        QTAILQ_FOREACH_SAFE(req, &n->ftl_pending, entry, next) {
+            if (req->sq == sq) {
+                QTAILQ_REMOVE(&n->ftl_pending, req, entry);
+                qatomic_dec(&n->ftl_pending_count);
+            }
+        }
+    }
+
     for (p = 1; p <= (int)n->nr_pollers; p++) {
         struct rte_ring *rings[2];
         int r;
@@ -649,6 +661,19 @@ void nvme_retire_ns_requests(FemuCtrl *n, NvmeNamespace *ns)
 
     assert(!n->dataplane_started);
     assert(ns);
+    QTAILQ_FOREACH_SAFE(req, &n->ftl_pending, entry, next) {
+        int poller;
+
+        if (req->ns != ns) {
+            continue;
+        }
+        poller = req->wfq_poller_idx;
+        QTAILQ_REMOVE(&n->ftl_pending, req, entry);
+        qatomic_dec(&n->ftl_pending_count);
+        nvme_retire_ns_request(req, req->status != NVME_SUCCESS ||
+                              req->expire_time <= nvme_io_clock(n));
+        QTAILQ_INSERT_TAIL(&n->cpl_backlog[poller], req, entry);
+    }
     for (p = 1; p <= n->nr_pollers; p++) {
         struct rte_ring *rings[2];
         int r;

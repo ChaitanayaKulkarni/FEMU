@@ -510,7 +510,8 @@ char *cdl_test_state(FemuCtrl *n)
         g_string_append_printf(out, "%u/%zu/%zu", p,
             femu_ring_count(n->to_ftl[p]), femu_ring_count(n->to_poller[p]));
     }
-    g_string_append_printf(out, ";quota=%u/%u;assoc=",
+    g_string_append_printf(out, ";backend-ready=%u;quota=%u/%u;assoc=",
+                           qatomic_read(&n->ftl_pending_count),
                            n->cdl_sqs_used, n->cdl_bound_used);
     for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
         g_string_append_printf(out, "%s%u:%u", c == 1 ? "" : ",",
@@ -1476,19 +1477,13 @@ static void cdl_release_slot(FemuCtrl *n, NvmeRequest *req, uint8_t cls)
     pthread_spin_unlock(&n->cdl_lock);
 }
 
-bool cdl_account(FemuCtrl *n, NvmeRequest *req)
+bool cdl_check(FemuCtrl *n, NvmeRequest *req)
 {
-    g_autofree char *txn_path = NULL;
-    Error *err = NULL;
     int64_t stop;
     int64_t elapsed;
     int64_t stop_delta = 0;
     bool miss;
     bool stop_override = false;
-    bool slot_released = false;
-    uint64_t txid;
-    uint64_t timed;
-    uint64_t misses;
     uint8_t cls = req->wfq_cdl_class;
 
     if (req->cdl_timed && n->cdl_store_failed) {
@@ -1498,10 +1493,7 @@ bool cdl_account(FemuCtrl *n, NvmeRequest *req)
         return true;
     }
     if (req->cdl_checked) {
-        stop = req->cdl_stop_ns;
-        elapsed = req->cdl_elapsed_ns;
-        miss = req->cdl_miss;
-        goto frozen;
+        return true;
     }
     pthread_spin_lock(&n->cdl_lock);
     if (n->cdl_test_stop_delta_valid) {
@@ -1559,12 +1551,28 @@ bool cdl_account(FemuCtrl *n, NvmeRequest *req)
                                     req->cdl_duration_ns, miss);
     /* The result is frozen before accounting, including on retries. */
     cdl_release_slot(n, req, cls);
-    slot_released = true;
     /* Pause/delete must still finish an accounting transaction already begun. */
     cdl_test_barrier_wait(n, CDL_BARRIER_CHECK);
     cdl_test_advance(n, CDL_TEST_DELAY_DURABLE);
 
-frozen:
+    return true;
+}
+
+bool cdl_account(FemuCtrl *n, NvmeRequest *req)
+{
+    g_autofree char *txn_path = NULL;
+    Error *err = NULL;
+    uint8_t cls = req->wfq_cdl_class;
+    uint64_t txid, timed, misses;
+    int64_t persist_start;
+
+    if (!cdl_check(n, req)) {
+        return false;
+    }
+    if (!req->cdl_timed || req->cdl_accounted) {
+        return true;
+    }
+    persist_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     qemu_mutex_lock(&n->cdl_store_lock);
     pthread_spin_lock(&n->cdl_lock);
     if (n->cdl_last_txid == UINT64_MAX) {
@@ -1584,7 +1592,7 @@ frozen:
     pthread_spin_lock(&n->cdl_lock);
     NvmeCdlClassStats *stats = &n->cdl_stats[cls];
     stats->timed = cdl_sat_inc(stats->timed, &stats->timed_saturated);
-    if (miss) {
+    if (req->cdl_miss) {
         stats->misses = cdl_sat_inc(stats->misses,
                                     &stats->misses_saturated);
     }
@@ -1617,15 +1625,14 @@ frozen:
         goto fail;
     }
     qemu_mutex_unlock(&n->cdl_store_lock);
+    trace_femu_cdl_persist_latency(n->cdl_trace_id, req->cdl_attempt, txid,
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - persist_start);
     return cdl_test_barrier_wait(n, CDL_BARRIER_DURABLE);
 
 fail:
     n->cdl_store_failed = true;
     n->bar.csts |= NVME_CSTS_FAILED;
     qemu_mutex_unlock(&n->cdl_store_lock);
-    if (!slot_released) {
-        cdl_release_slot(n, req, cls);
-    }
     if (err) {
         error_report_err(err);
     }

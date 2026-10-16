@@ -20383,7 +20383,8 @@ static void femu_test_cdl_ring_pressure(void *obj, void *data,
     femu_cdl_submit_reads_bulk(&c, &c.io, data_buf, 12);
     for (unsigned poll = 0;; poll++) {
         g_autofree char *state = femu_cdl_test_state(qts, id);
-        if (ftl ? strstr(state, ";rings=1/4/7;") != NULL :
+        if (ftl ? (strstr(state, ";rings=1/0/7;") != NULL &&
+                   strstr(state, ";backend-ready=5;") != NULL) :
                   strstr(state, ";rings=1/7/0;") != NULL) {
             break;
         }
@@ -20392,13 +20393,13 @@ static void femu_test_cdl_ring_pressure(void *obj, void *data,
     }
     g_assert_false(femu_cq_ready(&c, &c.io));
     femu_cdl_read_stats(&c, qts, buf, 1, &flags, &timed, &misses);
-    for (unsigned poll = 0; ftl && timed < 8; poll++) {
-        /* Ring occupancy is visible before the retained request's check. */
+    for (unsigned poll = 0; ftl && timed < 12; poll++) {
+        /* Every ready result is durable even while CQ delivery is held. */
         g_assert_cmpuint(poll, <, FEMU_POLL_LIMIT_MS);
         g_usleep(1000);
         femu_cdl_read_stats(&c, qts, buf, 1, &flags, &timed, &misses);
     }
-    g_assert_cmpuint(timed, ==, ftl ? 8 : 0);
+    g_assert_cmpuint(timed, ==, ftl ? 12 : 0);
     g_assert_cmpuint(misses, ==, 0);
     femu_cdl_test_control(qts, id, "hold-completion=0");
     for (unsigned i = 0; i < 12; i++) {

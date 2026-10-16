@@ -2232,6 +2232,9 @@ typedef struct FemuCtrl {
     QemuThread      ftl_thread; /* one FTL thread serving every namespace */
     bool            ftl_thread_running;
     bool            ftl_stopping;   /* asks the FTL thread to leave its loop */
+    /* Executed timed requests waiting for modeled media completion/accounting. */
+    QTAILQ_HEAD(, NvmeRequest) ftl_pending;
+    uint32_t        ftl_pending_count;
     /*
      * Fixed at realize from the namespace modes, not the controller mode,
      * since namespaces may run different modes: completions then arrive
@@ -3045,6 +3048,7 @@ bool cdl_init(FemuCtrl *n, Error **errp);
 void cdl_exit(FemuCtrl *n);
 void cdl_reset(FemuCtrl *n);
 bool cdl_save_state(FemuCtrl *n, Error **errp);
+bool cdl_check(FemuCtrl *n, NvmeRequest *req);
 bool cdl_account(FemuCtrl *n, NvmeRequest *req);
 uint16_t nvme_cdl_execute(FemuCtrl *n, NvmeRequest *req);
 int64_t nvme_io_clock(FemuCtrl *n);
