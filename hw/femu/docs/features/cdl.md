@@ -78,3 +78,34 @@ It requires an unchanged configuration file and no journal. Historical statistic
 fixtures are outside default discovery. This gate does not claim full scheduler
 conformance. The guest fio smoke independently checks256 CRC-verified reads,
 explicit priority and same-CPU hint swaps through the kernel and NAND backend.
+
+## Duration-weighted in-flight limits
+
+The FEMU scheduler limits both total timed in-flight requests (`wfq_depth`) and
+the number owned by each bound class. Limits use reciprocal configured durations,
+with at least one slot per bound class. Rounding removes any over-allocation
+from the largest allocation and distributes remaining slots by largest fractional
+remainder, breaking ties by class ID. For depth64 and durations300/5000us the
+limits are60/4. These are concurrency limits, not guaranteed throughput shares.
+
+A class retains its reservation while any of its SQs remain bound, including
+while it has no pending requests. Other bound classes cannot borrow that
+reservation: issued backend work cannot be preempted on a high-priority arrival.
+Consequently, low offered depth can leave slots unused and reduce throughput.
+Creating more SQs for a class does not increase its allocation. Configured
+classes without bound SQs reserve nothing; deleting the last SQ redistributes
+its allocation and kicks pending work. Existing in-flight requests are drained,
+not canceled, when adding a class shrinks an allocation.
+
+If there are more bound classes than slots, simultaneous minimum-one reservations
+are impossible. FEMU retains the global ceiling and weighted ordering with aging,
+allowing every class to progress rather than permanently allocating zero slots.
+This case does not provide simultaneous per-class slot protection.
+
+Allocation runs only on SQ membership changes. The request path adds a limit
+comparison to the existing class scan; no statistics, persistent I/O or kernel
+changes are required. Class0 remains on the existing ordinary path.
+
+Current qtests `cdl-low-qd-occupancy` and `cdl-slot-*` cover returning low-QD
+traffic, retained/released reservations, unequal and equal durations, extreme
+durations, rounding, depths1/2, four-class allocation and completion progress.

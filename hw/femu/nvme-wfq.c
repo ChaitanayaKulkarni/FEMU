@@ -855,6 +855,7 @@ bool cdl_init(FemuCtrl *n, Error **errp)
     n->cdl_saved_desc_present = g_new0(bool, n->cdl_num_classes);
     n->cdl_assoc = g_new0(uint32_t, n->cdl_num_classes);
     n->cdl_inflight_by_class = g_new0(uint32_t, n->cdl_num_classes);
+    n->cdl_inflight_limit = g_new0(uint32_t, n->cdl_num_classes);
     n->cdl_members = g_new0(CdlBitmap, n->cdl_num_classes);
     n->cdl_ready_sqs = g_new0(CdlBitmap, n->cdl_num_classes);
     size_t sq_words = DIV_ROUND_UP(n->nr_io_queues + 1, 64);
@@ -938,6 +939,7 @@ void cdl_exit(FemuCtrl *n)
     g_clear_pointer(&n->cdl_saved_desc_present, g_free);
     g_clear_pointer(&n->cdl_assoc, g_free);
     g_clear_pointer(&n->cdl_inflight_by_class, g_free);
+    g_clear_pointer(&n->cdl_inflight_limit, g_free);
     g_clear_pointer(&n->cdl_members, g_free);
     g_clear_pointer(&n->cdl_ready_sqs, g_free);
     g_clear_pointer(&n->cdl_bitmap_words, g_free);
@@ -1111,6 +1113,83 @@ static void cdl_sq_ready_clear(FemuCtrl *n, NvmeSQueue *sq)
     }
 }
 
+/* Recomputed on SQ membership changes, never on the request hot path.
+ * Bound classes retain their reservations even while temporarily idle: issued
+ * backend work cannot be recalled when a low-QD class returns. Unbound classes
+ * reserve nothing. Multiple SQs do not multiply a class's allocation.
+ */
+static void cdl_recompute_inflight_limits(FemuCtrl *n)
+{
+    uint64_t weight[CDL_MAX_CLASSES] = { 0 };
+    __uint128_t remainder[CDL_MAX_CLASSES] = { 0 };
+    __uint128_t total_weight = 0;
+    uint32_t classes = 0;
+    uint32_t allocated = 0;
+
+    memset(n->cdl_inflight_limit, 0,
+           n->cdl_num_classes * sizeof(*n->cdl_inflight_limit));
+    for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
+        if (n->cdl_members[c].summary && n->cdl_desc[c].duration_us) {
+            weight[c] = UINT64_MAX / n->cdl_desc[c].duration_us;
+            total_weight += weight[c];
+            classes++;
+        }
+    }
+    if (!classes) {
+        return;
+    }
+    /* A fixed reservation for each class is impossible at this depth. Keep
+     * the global ceiling and weighted/aging arbitration so every class can
+     * progress; do not give some classes a permanent zero-slot allocation.
+     */
+    if (classes > n->wfq_depth) {
+        for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
+            n->cdl_inflight_limit[c] = weight[c] ? n->wfq_depth : 0;
+        }
+        return;
+    }
+    for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
+        if (weight[c]) {
+            __uint128_t share = (__uint128_t)n->wfq_depth * weight[c];
+
+            n->cdl_inflight_limit[c] = MAX(1, share / total_weight);
+            remainder[c] = share % total_weight;
+            allocated += n->cdl_inflight_limit[c];
+        }
+    }
+    /* Minimum-one rounding may exceed the pool. Trim the largest allocation,
+     * retaining at least one slot per class. No global overcommit is allowed.
+     */
+    while (allocated > n->wfq_depth) {
+        uint32_t donor = 0;
+
+        for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
+            if (n->cdl_inflight_limit[c] > 1 &&
+                n->cdl_inflight_limit[c] >= n->cdl_inflight_limit[donor]) {
+                donor = c;
+            }
+        }
+        assert(donor);
+        n->cdl_inflight_limit[donor]--;
+        allocated--;
+    }
+    /* Assign unused slots by largest remainder; class ID breaks ties. */
+    while (allocated < n->wfq_depth) {
+        uint32_t recipient = 0;
+
+        for (uint32_t c = 1; c < n->cdl_num_classes; c++) {
+            if (weight[c] && (!recipient ||
+                             remainder[c] > remainder[recipient])) {
+                recipient = c;
+            }
+        }
+        assert(recipient);
+        n->cdl_inflight_limit[recipient]++;
+        remainder[recipient] = 0;
+        allocated++;
+    }
+}
+
 static void cdl_dispatch_locked(FemuCtrl *n)
 {
     bool *blocked = NULL;
@@ -1150,7 +1229,8 @@ static void cdl_dispatch_locked(FemuCtrl *n)
             NvmeRequest *req = n->cdl_candidates[c].req;
             uint64_t finish;
 
-            if (!req) {
+            if (!req || n->cdl_inflight_by_class[c] >=
+                        n->cdl_inflight_limit[c]) {
                 continue;
             }
             finish = n->cdl_candidates[c].finish;
@@ -1323,6 +1403,7 @@ void cdl_sq_created(FemuCtrl *n, NvmeSQueue *sq)
     pthread_spin_lock(&n->cdl_lock);
     assert(sq->cdl_quota_reserved && n->cdl_assoc[cls]);
     cdl_bitmap_set(&n->cdl_members[cls], sq->sqid);
+    cdl_recompute_inflight_limits(n);
     if (!n->cdl_rr_next[cls] ||
         (!n->cdl_rr_started[cls] && sq->sqid < n->cdl_rr_next[cls])) {
         n->cdl_rr_next[cls] = sq->sqid;
@@ -1360,6 +1441,7 @@ void cdl_sq_deleted(FemuCtrl *n, NvmeSQueue *sq)
     sq->cdl_quota_reserved = false;
     cdl_sq_ready_clear(n, sq);
     cdl_bitmap_clear(&n->cdl_members[cls], sq->sqid);
+    cdl_recompute_inflight_limits(n);
     if (!n->cdl_assoc[cls]) {
         n->cdl_rr_started[cls] = false;
     }
@@ -1553,6 +1635,8 @@ void wfq_init(FemuCtrl *n)
            n->cdl_num_classes * sizeof(*n->cdl_candidates));
     memset(n->cdl_inflight_by_class, 0,
            n->cdl_num_classes * sizeof(*n->cdl_inflight_by_class));
+    memset(n->cdl_inflight_limit, 0,
+           n->cdl_num_classes * sizeof(*n->cdl_inflight_limit));
     memset(n->cdl_dispatch_wait, 0,
            n->cdl_num_classes * sizeof(*n->cdl_dispatch_wait));
     memset(n->wfq_f_last, 0,

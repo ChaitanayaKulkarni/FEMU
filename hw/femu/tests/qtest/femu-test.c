@@ -20905,6 +20905,229 @@ static void femu_cdl_submit_two_backlogs(FemuCtrlState *c, FemuQueue *first,
     }
 }
 
+/* Protect in-flight slots for low-QD and returning high-priority classes.
+ * Completion hold makes occupancy checks independent of backend timing.
+ */
+static void femu_test_cdl_low_qd_occupancy(void *obj, void *data,
+                                         QGuestAllocator *alloc)
+{
+    const char *id = "cdl-low-qd-occupancy";
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    uint64_t buf = guest_alloc(alloc, FEMU_DATA_SIZE);
+    static const unsigned depths[] = { 0, 1, 64 };
+
+    for (unsigned phase = 0; phase < ARRAY_SIZE(depths); phase++) {
+        unsigned high_qd = depths[phase];
+        FemuQueue high, high_extra, low;
+        uint64_t counts[3] = { 0 };
+        unsigned pending, inflight, hold, blocked;
+        uint64_t total;
+        g_autofree char *state = NULL;
+        g_auto(GStrv) entries = NULL;
+        char *order;
+
+        femu_enable(&c, &femu->dev, alloc);
+        femu_cdl_configure_two(&c, 300, 5000);
+        femu_cdl_create_queue_size(&c, &high, 1, 1, 512);
+        femu_cdl_create_queue_size(&c, &low, 2, 2, 512);
+        femu_cdl_create_queue_size(&c, &high_extra, 3, 1, 512);
+        femu_cdl_test_control(qts, id, "reset");
+        femu_cdl_test_control(qts, id, "hold=1");
+        femu_cdl_test_control(qts, id, "hold-completion=1");
+        if (high_qd) {
+            femu_cdl_submit_reads_bulk(&c, &high, buf, high_qd);
+        }
+        femu_cdl_submit_reads_bulk(&c, &low, buf, 256);
+        femu_cdl_wait_pending(qts, id, 256 + high_qd);
+        femu_cdl_test_control(qts, id, "hold=0");
+        state = femu_cdl_test_state(qts, id);
+        g_assert_cmpint(sscanf(state,
+            "pending=%u;inflight=%u;hold=%u;blocked=%u;total=%" SCNu64,
+            &pending, &inflight, &hold, &blocked, &total), ==, 5);
+        g_assert_cmpuint(inflight, ==, 4 + MIN(high_qd, 60));
+        g_assert_cmpuint(total, ==, 4 + MIN(high_qd, 60));
+        g_assert_cmpuint(pending, ==, 256 + high_qd - total);
+        order = strstr(state, ";order=");
+        g_assert_nonnull(order);
+        entries = g_strsplit(order + strlen(";order="), ",", -1);
+        g_assert_cmpuint(g_strv_length(entries), ==, total);
+        for (unsigned i = 0; entries[i]; i++) {
+            unsigned cls, sqid, cid;
+
+            g_assert_cmpint(sscanf(entries[i], "%u/%u/%u", &cls, &sqid,
+                                   &cid), ==, 3);
+            g_assert_cmpuint(cls, >=, 1);
+            g_assert_cmpuint(cls, <=, 2);
+            counts[cls]++;
+        }
+        g_test_message("QD%u: initial dispatches C1=%" PRIu64
+                       " C2=%" PRIu64, high_qd, counts[1], counts[2]);
+        g_assert_cmpuint(counts[1], ==, MIN(high_qd, 60));
+        g_assert_cmpuint(counts[2], ==, 4);
+
+        /* A returning C1 dispatches without waiting for a C2 completion. */
+        if (high_qd < 64) {
+            g_autofree char *after = NULL;
+
+            femu_cdl_test_control(qts, id, "hold=1");
+            femu_cdl_submit_read(&c, &high, buf);
+            femu_cdl_wait_pending(qts, id, pending + 1);
+            femu_cdl_test_control(qts, id, "hold=0");
+            after = femu_cdl_test_state(qts, id);
+            g_assert_cmpint(sscanf(after,
+                "pending=%u;inflight=%u;hold=%u;blocked=%u;total=%" SCNu64,
+                &pending, &inflight, &hold, &blocked, &total), ==, 5);
+            g_assert_cmpuint(total, ==, 5 + high_qd);
+            g_test_message("returning C1 dispatched while C2 completions remain held");
+        }
+        femu_cdl_test_control(qts, id, "hold-completion=0");
+        for (unsigned i = 0; i < high_qd + (high_qd < 64); i++) {
+            uint16_t cid;
+
+            g_assert_cmpint(FEMU_SC(femu_complete(&c, &high, &cid, NULL)),
+                            ==, NVME_SUCCESS);
+        }
+        for (unsigned i = 0; i < 256; i++) {
+            uint16_t cid;
+
+            g_assert_cmpint(FEMU_SC(femu_complete(&c, &low, &cid, NULL)),
+                            ==, NVME_SUCCESS);
+        }
+        /* An extra SQ does not multiply a class reservation; deleting only
+         * one of its SQs must not release that reservation either.
+         */
+        g_assert_cmpint(FEMU_SC(femu_delete_sq(&c, high.qid)), ==,
+                        NVME_SUCCESS);
+        femu_cdl_test_control(qts, id, "reset");
+        femu_cdl_test_control(qts, id, "hold=1");
+        femu_cdl_test_control(qts, id, "hold-completion=1");
+        femu_cdl_submit_reads_bulk(&c, &low, buf, 128);
+        femu_cdl_wait_pending(qts, id, 128);
+        femu_cdl_test_control(qts, id, "hold=0");
+        femu_cdl_wait_pending(qts, id, 124);
+        /* Deleting the last C1 SQ releases its unused allocation. Pending
+         * C2 work must be kicked immediately and can now occupy depth64.
+         */
+        g_assert_cmpint(FEMU_SC(femu_delete_sq(&c, high_extra.qid)), ==,
+                        NVME_SUCCESS);
+        femu_cdl_wait_pending(qts, id, 64);
+        femu_cdl_test_control(qts, id, "hold-completion=0");
+        for (unsigned i = 0; i < 128; i++) {
+            uint16_t cid;
+
+            g_assert_cmpint(FEMU_SC(femu_complete(&c, &low, &cid, NULL)),
+                            ==, NVME_SUCCESS);
+        }
+        femu_disable(&c);
+        femu_queue_free(&c, &low);
+        femu_queue_free(&c, &high_extra);
+        femu_queue_free(&c, &high);
+    }
+    guest_free(alloc, buf);
+}
+
+typedef struct FemuCdlSlotCase {
+    const char *name;
+    unsigned depth;
+    unsigned classes;
+    uint32_t durations[4];
+    unsigned first_wave[4];
+} FemuCdlSlotCase;
+
+static const FemuCdlSlotCase femu_cdl_slot_cases[] = {
+    { "weighted", 64, 2, { 300, 5000 }, { 60, 4 } },
+    { "reverse", 64, 2, { 5000, 300 }, { 4, 60 } },
+    { "equal", 64, 2, { 300, 300 }, { 32, 32 } },
+    { "extreme", 64, 2, { 1, UINT32_MAX }, { 63, 1 } },
+    { "minimum", 3, 3, { 1, UINT32_MAX, UINT32_MAX }, { 1, 1, 1 } },
+    { "minimum-large", 64, 3,
+      { 1, UINT32_MAX, UINT32_MAX }, { 62, 1, 1 } },
+    { "depth-one", 1, 2, { 300, 5000 }, { 1, 0 } },
+    { "depth-two", 2, 3,
+      { 1, UINT32_MAX, UINT32_MAX }, { 2, 0, 0 } },
+    { "four-class", 16, 4, { 300, 600, 1200, 2400 }, { 9, 4, 2, 1 } },
+};
+
+/* Enforce global depth and bounded class allocations, including rounding,
+ * tiny pools and the full descriptor range. Drain every submitted command
+ * to establish forward progress, not just the initial dispatch order.
+ */
+static void femu_test_cdl_slot_limits(void *obj, void *data,
+                                      QGuestAllocator *alloc)
+{
+    const FemuCdlSlotCase *test = data;
+    g_autofree char *id = g_strdup_printf("cdl-slot-%s", test->name);
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    FemuQueue queues[4];
+    uint64_t buf = guest_alloc(alloc, FEMU_DATA_SIZE);
+    uint32_t result;
+    unsigned counts[4] = { 0 };
+    unsigned pending, inflight;
+    g_autofree char *state = NULL;
+    g_auto(GStrv) entries = NULL;
+    char *order;
+
+    femu_enable(&c, &femu->dev, alloc);
+    for (unsigned i = 0; i < test->classes; i++) {
+        g_assert_cmpint(FEMU_SC(femu_cdl_desc(&c, true, false, 0, i + 1,
+                                              test->durations[i], 0)), ==,
+                        NVME_SUCCESS);
+    }
+    g_assert_cmpint(FEMU_SC(femu_set_feature(&c, FEMU_CDL_FID, false, 0, 4,
+                                             &result)), ==, NVME_SUCCESS);
+    for (unsigned i = 0; i < test->classes; i++) {
+        femu_cdl_create_queue_size(&c, &queues[i], i + 1, i + 1, 512);
+    }
+    femu_cdl_test_control(qts, id, "reset");
+    femu_cdl_test_control(qts, id, "hold=1");
+    femu_cdl_test_control(qts, id, "hold-completion=1");
+    for (unsigned i = 0; i < test->classes; i++) {
+        femu_cdl_submit_reads_bulk(&c, &queues[i], buf, 128);
+    }
+    femu_cdl_wait_pending(qts, id, 128 * test->classes);
+    femu_cdl_test_control(qts, id, "hold=0");
+    state = femu_cdl_test_state(qts, id);
+    g_assert_cmpint(sscanf(state, "pending=%u;inflight=%u", &pending,
+                           &inflight), ==, 2);
+    g_assert_cmpuint(inflight, ==, test->depth);
+    g_assert_cmpuint(pending, ==, 128 * test->classes - test->depth);
+    order = strstr(state, ";order=");
+    g_assert_nonnull(order);
+    entries = g_strsplit(order + strlen(";order="), ",", -1);
+    g_assert_cmpuint(g_strv_length(entries), ==, test->depth);
+    for (unsigned i = 0; entries[i]; i++) {
+        unsigned cls, sqid, cid;
+
+        g_assert_cmpint(sscanf(entries[i], "%u/%u/%u", &cls, &sqid, &cid),
+                        ==, 3);
+        g_assert_cmpuint(cls, >=, 1);
+        g_assert_cmpuint(cls, <=, test->classes);
+        counts[cls - 1]++;
+    }
+    for (unsigned i = 0; i < test->classes; i++) {
+        g_assert_cmpuint(counts[i], ==, test->first_wave[i]);
+    }
+    femu_cdl_test_control(qts, id, "hold-completion=0");
+    for (unsigned i = 0; i < test->classes; i++) {
+        for (unsigned j = 0; j < 128; j++) {
+            uint16_t cid;
+
+            g_assert_cmpint(FEMU_SC(femu_complete(&c, &queues[i], &cid,
+                                                  NULL)), ==, NVME_SUCCESS);
+        }
+    }
+    femu_cdl_wait_pending(qts, id, 0);
+    femu_disable(&c);
+    for (unsigned i = 0; i < test->classes; i++) {
+        femu_queue_free(&c, &queues[i]);
+    }
+    guest_free(alloc, buf);
+}
+
 typedef struct FemuCdlSeedCase {
     char *id;
     unsigned seed;
@@ -22795,6 +23018,39 @@ static void femu_register_nodes(void)
                 "queues=4,cdl_classes=3,cdl_max_sqs=4,cdl_sqs_per_class=2,"
                 "cdl_bound_classes=2,multipoller_enabled=1,poller_ratio=2,"
                 "cdl_file=%s", path),
+        });
+    }
+    {
+        char *path = g_strdup_printf("%s/femu-cdl-low-qd-%d.state",
+                                     g_get_tmp_dir(), (int)getpid());
+
+        femu_cdl_clean_store(path);
+        qos_add_test("cdl-low-qd-occupancy", "femu",
+                     femu_test_cdl_low_qd_occupancy,
+                     &(QOSGraphTestOptions) {
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=cdl-low-qd-occupancy,vid=0x8086,did=0x5845,cdl=on,"
+                "cdl_classes=3,cdl_max_sqs=8,cdl_sqs_per_class=8,"
+                "cdl_bound_classes=2,entries=511,wfq_depth=64,"
+                "multipoller_enabled=0,cdl_file=%s", path),
+        });
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(femu_cdl_slot_cases); i++) {
+        const FemuCdlSlotCase *test = &femu_cdl_slot_cases[i];
+        char *path = g_strdup_printf("%s/femu-cdl-slot-%s-%d.state",
+                                     g_get_tmp_dir(), test->name, (int)getpid());
+        char *name = g_strdup_printf("cdl-slot-%s", test->name);
+
+        femu_cdl_clean_store(path);
+        qos_add_test(name, "femu", femu_test_cdl_slot_limits,
+                     &(QOSGraphTestOptions) {
+            .arg = (void *)test,
+            .edge.extra_device_opts = g_strdup_printf(
+                "id=%s,vid=0x8086,did=0x5845,cdl=on,cdl_classes=%u,"
+                "cdl_max_sqs=%u,cdl_sqs_per_class=2,cdl_bound_classes=%u,"
+                "entries=511,wfq_depth=%u,multipoller_enabled=0,cdl_file=%s",
+                name, test->classes + 1, test->classes * 2, test->classes,
+                test->depth, path),
         });
     }
     /* Retain historical fixtures for explicit archaeology, outside the current gate. */

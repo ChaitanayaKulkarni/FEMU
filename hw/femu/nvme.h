@@ -2447,6 +2447,7 @@ typedef struct FemuCtrl {
     uint32_t            wfq_inflight;
     uint32_t            cdl_dispatch_kick;
     uint32_t            *cdl_inflight_by_class;
+    uint32_t            *cdl_inflight_limit;
     CdlBitmap           *cdl_members;
     CdlBitmap           *cdl_ready_sqs;
     CdlBitmap           cdl_ready_classes;
